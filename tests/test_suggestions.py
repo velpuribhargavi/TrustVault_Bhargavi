@@ -27,7 +27,7 @@ def test_suggestions_never_grant_by_themselves(world, db):
     assert [i["username"] for i in items] == ["frank"]
     assert items[0]["permission"] == "view" and items[0]["reasons"]  # least privilege: never download/edit
     assert _grant_count(db) == before  # nothing changed
-    assert world["frank"].get(f"/api/documents/{world.doc_a}").status_code == 404
+    assert world["frank"].get(f"/api/documents/{world.doc_a}").status_code == 403
 
 
 def test_confirmed_suggestion_records_both_suggestion_and_decision(world, db):
@@ -40,7 +40,7 @@ def test_confirmed_suggestion_records_both_suggestion_and_decision(world, db):
     assert generated and json.loads(generated[-1]["details"])["suggestions"][0]["username"] == "frank"
     accepted = audit_rows(db, action="ai.suggestion.accepted", document_id=world.doc_a)
     assert accepted and accepted[-1]["actor_name"] == "alice"
-    grant = audit_rows(db, action="permission.grant", document_id=world.doc_a)[-1]
+    grant = audit_rows(db, action="access.granted", document_id=world.doc_a)[-1]
     assert json.loads(grant["details"])["suggestion_id"] == sug["suggestion_id"]
     assert world["frank"].get(f"/api/documents/{world.doc_a}").status_code == 200
     # a suggestion can only be used once
@@ -77,7 +77,7 @@ def test_suggestions_do_not_leak_other_owners_sharing(world):
 
 def test_only_owner_may_ask_for_suggestions(world):
     assert world["dave"].get(f"/api/documents/{world.doc_a}/suggestions").status_code == 403
-    assert world["bob"].get(f"/api/documents/{world.doc_a}/suggestions").status_code == 404
+    assert world["bob"].get(f"/api/documents/{world.doc_a}/suggestions").status_code == 403
 
 
 def test_never_suggests_admins_inactive_or_existing(world):

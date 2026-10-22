@@ -18,6 +18,11 @@ class LoginRequest(Strict):
     mode: Literal["cookie", "bearer"] = "cookie"
 
 
+class LogoutRequest(Strict):
+    """Sent by the browser when its own idle / end-of-day timer signs the user out."""
+    reason: Optional[Literal["idle", "max_lifetime"]] = None
+
+
 class ChangePasswordRequest(Strict):
     current_password: str = Field(min_length=1, max_length=256)
     new_password: str = Field(min_length=1, max_length=256)
@@ -29,21 +34,35 @@ class DocumentUpdate(Strict):
     description: Optional[str] = Field(default=None, max_length=2000)
 
 
+# Upper bound for any duration field; the real limit (MAX_GRANT_DAYS) is
+# checked in the endpoint so it can be configured.
+_MAX_MINUTES = 366 * 24 * 60
+
+
 class GrantRequest(Strict):
+    """Give (or change) one person's access. Every grant expires: send either
+    ``duration_minutes`` or an absolute ``expires_at``; with neither, the
+    grant lasts DEFAULT_GRANT_MINUTES (config.py)."""
     username: str = Field(min_length=1, max_length=64)
     permission: Literal["view", "download", "edit"]
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=_MAX_MINUTES)
     expires_at: Optional[datetime] = None
     suggestion_id: Optional[str] = Field(default=None, max_length=64)
 
 
-class ShareLinkRequest(Strict):
-    expires_in_hours: int = Field(ge=1, le=24 * 365)
-    max_uses: int = Field(ge=1, le=10_000)
-    label: str = Field(default="", max_length=100)
+class ExtendGrantRequest(Strict):
+    """Add time to a grant (counted from its expiry, or from now if it already ran out)."""
+    minutes: int = Field(ge=1, le=_MAX_MINUTES)
 
 
-class ShareTokenRequest(Strict):
-    token: str = Field(min_length=10, max_length=128)
+class LinkRequest(Strict):
+    """A 5-minute share link for one named person."""
+    username: str = Field(min_length=1, max_length=64)
+    permission: Literal["view", "download"] = "view"
+
+
+class LinkOpenRequest(Strict):
+    token: str = Field(min_length=10, max_length=1024)
 
 
 class CreateUserRequest(Strict):

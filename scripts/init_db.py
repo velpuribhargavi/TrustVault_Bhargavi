@@ -23,7 +23,6 @@ from trustvault.audit import AuditContext  # noqa: E402
 from trustvault.config import load_settings  # noqa: E402
 from trustvault.context import AppContext  # noqa: E402
 from trustvault.db import SchemaVersionError, connect, init_schema, transaction  # noqa: E402
-from trustvault.security import hash_token, new_token  # noqa: E402
 from trustvault.services import store_version  # noqa: E402
 from trustvault.utils import iso_in, new_id, now_iso  # noqa: E402
 from trustvault.validation import validate_upload  # noqa: E402
@@ -118,26 +117,31 @@ SALARY = pdf(
     "TrustVault is watermarked with your name and recorded in the audit trail.",
 )
 
+# Every grant expires (the API default is DEFAULT_GRANT_MINUTES = 30). The demo
+# grants last a week so the demo data still works tomorrow; the owner can extend
+# or shorten them in the UI.
+SEED_GRANT_DAYS = 7
+
 DOCUMENTS = [
-    # owner, filename, display name, category, description, content, grants [(user, level, days or None)]
+    # owner, filename, display name, category, description, content, grants [(user, level, days)]
     ("owner", "salary-letter-vikram.pdf", "Salary letter - Vikram", "hr",
-     "Shared with Vikram as VIEW ONLY (read in the browser, no download).", SALARY, [("viewer", "view", None)]),
+     "Shared with Vikram as VIEW ONLY (read in the browser, no download).", SALARY, [("viewer", "view", SEED_GRANT_DAYS)]),
     ("owner", "office-floor-plan.png", "Office floor plan", "general",
-     "Shared as VIEW ONLY.", png(), [("viewer", "view", None)]),
+     "Shared as VIEW ONLY.", png(), [("viewer", "view", SEED_GRANT_DAYS)]),
     ("owner", "q3-contract-acme.docx", "Q3 services contract - Acme Corp", "contract",
      "Shared with Vikram as VIEW + DOWNLOAD.",
      docx("MASTER SERVICES AGREEMENT", "Between our company and Acme Corp, for Q3 2026.",
           "1. Scope: document management services.", "2. Fees: INR 12,00,000 per quarter."),
-     [("viewer", "download", None)]),
+     [("viewer", "download", SEED_GRANT_DAYS)]),
     ("owner", "budget-2026.csv", "Budget 2026", "finance",
      "Shared with Vikram with EDIT access (he can upload new versions and rename it).",
      b"department,quarter,amount\nEngineering,Q1,450000\nEngineering,Q2,470000\nSales,Q1,300000\nSales,Q2,320000\n",
-     [("viewer", "edit", None)]),
+     [("viewer", "edit", SEED_GRANT_DAYS)]),
     ("owner", "board-minutes-private.pdf", "Board minutes - private", "legal",
      "NOT shared with anyone. Vikram must never be able to reach it.",
      pdf("BOARD MINUTES - PRIVATE\n\nDiscussion of the planned acquisition. Not for distribution."), []),
     ("owner", "audit-papers-fy2026.csv", "Audit papers FY2025-26", "audit",
-     "Not shared with any account; has an external share link for the audit firm.",
+     "Not shared with anyone. Try a 5-minute share link: Share link -> Vikram -> open it as viewer.",
      b"account,description,amount\n4000,Revenue,1250000.00\n5000,Cost of sales,-640000.00\n6100,Salaries,-310000.00\n",
      []),
 ]
@@ -205,34 +209,25 @@ def main() -> None:
                              details={"name": name, "filename": safe_name, "category": category,
                                       "size": v["size_bytes"], "sha256": v["sha256"], "seeded": True})
             for user, perm, days in grants:
-                expires = iso_in(days=days) if days else None
+                expires = iso_in(days=days)
                 gid = new_id()
                 tx.execute("""INSERT INTO grants (id, document_id, user_id, permission, granted_by, created_at, expires_at)
                               VALUES (?, ?, ?, ?, ?, ?, ?)""", (gid, doc_id, ids[user], perm, ids[owner], now_iso(), expires))
-                ctx.audit.append(tx, actor, "permission.grant", "allowed", document_id=doc_id, target_user_id=ids[user],
+                ctx.audit.append(tx, actor, "access.granted", "allowed", document_id=doc_id, target_user_id=ids[user],
                                  details={"permission": perm, "expires_at": expires, "target_username": user,
                                           "target_external": False, "grant_id": gid, "seeded": True})
-        if filename.startswith("audit-papers"):
-            token = new_token()
-            link_id = new_id()
-            with transaction(conn) as tx:
-                tx.execute("""INSERT INTO share_links (id, document_id, token_hash, created_by, created_at, expires_at,
-                                                      max_uses, label) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                           (link_id, doc_id, hash_token(token), ids[owner], now_iso(), iso_in(hours=72), 5,
-                            "Demo link for the audit firm"))
-                ctx.audit.append(tx, actor, "share_link.create", "allowed", document_id=doc_id,
-                                 details={"link_id": link_id, "max_uses": 5, "seeded": True})
-            demo_link = f"http://127.0.0.1:8000/share#{token}"
 
     print("\nThe three demo logins (change these before any real use):")
     print(f"  {'role':8} {'username':9} password")
     for username, _, role, password, external in USERS:
         print(f"  {role:8} {username:9} {password}")
-    print("\nWhat 'viewer' can do with each of owner's documents:")
+    print(f"\nWhat 'viewer' can do with each of owner's documents (grants last {SEED_GRANT_DAYS} days):")
     for _, _, name, _, _, _, grants in DOCUMENTS:
         level = grants[0][1] if grants else "NO ACCESS"
         print(f"  {level:10} {name}")
-    print(f"\nDemo external share link (valid 72 h, 5 downloads):\n  {demo_link}")
+    print(f"\nTime limits: new grants {settings.default_grant_minutes} min by default, share links "
+          f"{settings.link_ttl_seconds // 60} min, sign-out after {settings.session_idle_minutes} min idle "
+          f"or {settings.session_absolute_hours} h.")
     print("\nNext: python -m trustvault   then open http://127.0.0.1:8000")
 
 

@@ -88,6 +88,16 @@ class KeyRing:
     def audit_mac(self, message: bytes) -> str:
         return hmac.new(self.audit_key, message, hashlib.sha256).hexdigest()
 
+    # --- share links ---------------------------------------------------------
+    @property
+    def link_key(self) -> bytes:
+        """Signing key for share links, derived from the master key with its own
+        label, so a link signature can never be confused with any other MAC."""
+        return hmac.new(self.master_key, b"trustvault|share-link-signing|v1", hashlib.sha256).digest()
+
+    def link_mac(self, message: bytes) -> bytes:
+        return hmac.new(self.link_key, message, hashlib.sha256).digest()
+
 
 def aad_for(document_id: str, version_id: str) -> bytes:
     return f"trustvault|{document_id}|{version_id}".encode("utf-8")

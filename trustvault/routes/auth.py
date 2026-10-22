@@ -4,6 +4,7 @@ from __future__ import annotations
 import secrets
 import sqlite3
 from datetime import timedelta
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
@@ -11,7 +12,7 @@ from ..audit import AuditContext
 from ..context import AppContext
 from ..db import transaction
 from ..deps import Principal, anonymous_audit_ctx, app_ctx, client_ip, cookie_name, current_principal, get_db
-from ..models import ChangePasswordRequest, LoginRequest
+from ..models import ChangePasswordRequest, LoginRequest, LogoutRequest
 from ..security import hash_token, new_token, password_problems
 from ..utils import clean_line, iso, now_iso, utcnow
 
@@ -95,7 +96,8 @@ def login(body: LoginRequest, request: Request, response: Response,
         ctx.audit.append(tx, AuditContext(user["id"], user["username"], ip, audit_ctx.user_agent),
                          "auth.login", "allowed", details={"mode": body.mode})
 
-    result = {"user": user_public(dict(user)), "csrf_token": csrf, "expires_at": iso(expires)}
+    result = {"user": user_public(dict(user)), "csrf_token": csrf, "expires_at": iso(expires),
+              "session": session_info(ctx, {"last_seen_at": iso(created), "expires_at": iso(expires)})}
     if body.mode == "bearer":
         result["token"] = token  # for API clients; no cookie is set
     else:
@@ -104,19 +106,45 @@ def login(body: LoginRequest, request: Request, response: Response,
     return result
 
 
-@router.post("/logout", summary="Sign out (any signed-in user)")
-def logout(response: Response, principal: Principal = Depends(current_principal),
+@router.post("/logout", summary="Sign out (any signed-in user). The browser sends a reason when its timer ran out.")
+def logout(response: Response, body: Optional[LogoutRequest] = None, principal: Principal = Depends(current_principal),
            conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
     with transaction(conn) as tx:
         tx.execute("DELETE FROM sessions WHERE token_hash = ?", (principal.token_hash,))
-        ctx.audit.append(tx, principal.audit_ctx, "auth.logout", "allowed")
+        if body is not None and body.reason:
+            ctx.audit.append(tx, principal.audit_ctx, "auth.session_expired", "info",
+                             details={"reason": body.reason, "detected": "browser",
+                                      "last_seen_at": principal.session["last_seen_at"]})
+        else:
+            ctx.audit.append(tx, principal.audit_ctx, "auth.logout", "allowed")
     response.delete_cookie(cookie_name(ctx), path="/")
     return {"ok": True}
 
 
-@router.get("/me", summary="Current user and CSRF token (any signed-in user)")
-def me(principal: Principal = Depends(current_principal)):
-    return {"user": user_public(principal.user), "csrf_token": principal.csrf_token}
+def session_info(ctx: AppContext, session: dict) -> dict:
+    """What the UI needs to warn before an idle or end-of-day sign-out."""
+    return {"idle_timeout_seconds": ctx.settings.session_idle_minutes * 60,
+            "warning_seconds": ctx.settings.session_warning_seconds,
+            "last_seen_at": session["last_seen_at"], "expires_at": session["expires_at"],
+            "server_time": now_iso()}
+
+
+@router.get("/me", summary="Current user, CSRF token and session limits (any signed-in user)")
+def me(principal: Principal = Depends(current_principal), ctx: AppContext = Depends(app_ctx)):
+    return {"user": user_public(principal.user), "csrf_token": principal.csrf_token,
+            "session": session_info(ctx, principal.session)}
+
+
+@router.post("/keepalive", summary="'Stay signed in': restart the idle timer (any signed-in user)")
+def keepalive(principal: Principal = Depends(current_principal), conn: sqlite3.Connection = Depends(get_db),
+              ctx: AppContext = Depends(app_ctx)):
+    # The absolute limit (SESSION_MAX_HOURS) is never extended - only the idle timer restarts.
+    now = now_iso()
+    with transaction(conn) as tx:
+        tx.execute("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?", (now, principal.token_hash))
+        ctx.audit.append(tx, principal.audit_ctx, "auth.session_extended", "info",
+                         details={"idle_timeout_minutes": ctx.settings.session_idle_minutes})
+    return {"ok": True, "session": session_info(ctx, {**principal.session, "last_seen_at": now})}
 
 
 @router.post("/change-password", summary="Change own password (any signed-in user)")

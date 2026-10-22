@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,6 +16,7 @@ from ..alerts import compute_alerts
 from ..context import AppContext
 from ..db import transaction
 from ..deps import Principal, app_ctx, get_db, require_role
+from ..expiry import log_expired_grants
 from ..models import CreateUserRequest, ResetPasswordRequest, UpdateUserRequest
 from ..security import password_problems
 from ..utils import clean_line, is_valid_id, iso, new_id, now_iso, utcnow
@@ -38,8 +39,8 @@ def list_users(principal: Principal = Depends(admin_only), conn: sqlite3.Connect
     rows = conn.execute(
         """SELECT u.*, (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id) AS active_sessions,
                   (SELECT COUNT(*) FROM documents d WHERE d.owner_id = u.id AND d.purged_at IS NULL) AS owned_documents,
-                  (SELECT COUNT(*) FROM grants g WHERE g.user_id = u.id) AS grants_held
-           FROM users u ORDER BY u.username COLLATE NOCASE"""
+                  (SELECT COUNT(*) FROM grants g WHERE g.user_id = u.id AND g.expires_at > :now) AS grants_held
+           FROM users u ORDER BY u.username COLLATE NOCASE""", {"now": now_iso()}
     ).fetchall()
     return {"items": [_user_row(r) for r in rows]}
 
@@ -104,7 +105,7 @@ def update_user(user_id: str, body: UpdateUserRequest, principal: Principal = De
         if changes.get("is_active") == 0:
             # Leaving the company: every session ends now. Grants and share
             # links are checked against is_active on every request, so they
-            # stop working at the same moment.
+            # stop working at the same moment (links they created included).
             revoked = tx.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],)).rowcount
         ctx.audit.append(tx, principal.audit_ctx, "user.update", "allowed", target_user_id=user["id"],
                          details={"username": user["username"], "sessions_revoked": revoked,
@@ -113,7 +114,7 @@ def update_user(user_id: str, body: UpdateUserRequest, principal: Principal = De
 
 
 @router.delete("/users/{user_id}",
-               summary="Delete a user (admin). Final: sign-in, sessions, grants and their share links end; "
+               summary="Delete a user (admin). Final: sign-in, sessions, grants and links end; "
                        "the record stays so the audit trail still names them.")
 def delete_user(user_id: str, principal: Principal = Depends(admin_only),
                 conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
@@ -130,15 +131,13 @@ def delete_user(user_id: str, principal: Principal = Depends(admin_only),
     with transaction(conn) as tx:
         grants = tx.execute("DELETE FROM grants WHERE user_id = ?", (user["id"],)).rowcount
         sessions = tx.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],)).rowcount
-        links = tx.execute("UPDATE share_links SET revoked_at = COALESCE(revoked_at, ?) WHERE created_by = ?",
-                           (now, user["id"])).rowcount
         tx.execute("UPDATE suggestions SET status = 'dismissed', decided_at = ? "
                    "WHERE suggested_user_id = ? AND status = 'pending'", (now, user["id"]))
         tx.execute("UPDATE users SET is_active = 0, deleted_at = ?, failed_logins = 0, locked_until = NULL "
                    "WHERE id = ?", (now, user["id"]))
         ctx.audit.append(tx, principal.audit_ctx, "user.delete", "allowed", target_user_id=user["id"],
                          details={"username": user["username"], "role": user["role"], "grants_removed": grants,
-                                  "sessions_revoked": sessions, "links_revoked": links})
+                                  "sessions_revoked": sessions})
     return {"ok": True, "grants_removed": grants, "sessions_revoked": sessions}
 
 
@@ -183,7 +182,7 @@ def revoke_sessions(user_id: str, principal: Principal = Depends(admin_only),
 # -------------------------------------------------------------------- audit --
 @router.get("/audit", summary="Search the audit trail (admin)")
 def audit_search(
-    action: Optional[str] = Query(None, max_length=64, description="Exact action or prefix ending in '.' e.g. 'permission.'"),
+    action: Optional[str] = Query(None, max_length=64, description="Exact action or prefix ending in '.' e.g. 'access.'"),
     outcome: Optional[Literal["allowed", "denied", "error", "info"]] = None,
     actor: Optional[str] = Query(None, max_length=64, description="Actor username"),
     document_id: Optional[str] = Query(None, max_length=64),
@@ -248,19 +247,22 @@ def alerts(hours: int = Query(24, ge=1, le=24 * 30), principal: Principal = Depe
 
 @router.get("/stats", summary="Dashboard counters (admin)")
 def stats(principal: Principal = Depends(admin_only), conn: sqlite3.Connection = Depends(get_db)):
-    since = iso(utcnow().replace(hour=0, minute=0, second=0, microsecond=0))
+    now = utcnow()
+    since = iso(now.replace(hour=0, minute=0, second=0, microsecond=0))
     q = lambda sql, *a: conn.execute(sql, a).fetchone()[0]  # noqa: E731
     return {
         "users": q("SELECT COUNT(*) FROM users WHERE is_active = 1"),
         "documents": q("SELECT COUNT(*) FROM documents WHERE deleted_at IS NULL AND purged_at IS NULL"),
         "in_trash": q("SELECT COUNT(*) FROM documents WHERE deleted_at IS NOT NULL AND purged_at IS NULL"),
-        "grants": q("SELECT COUNT(*) FROM grants"),
-        "active_links": q("SELECT COUNT(*) FROM share_links WHERE revoked_at IS NULL AND expires_at > ? "
-                          "AND use_count < max_uses", now_iso()),
+        "grants": q("SELECT COUNT(*) FROM grants WHERE expires_at > ?", iso(now)),
+        "expiring_24h": q("SELECT COUNT(*) FROM grants WHERE expires_at > ? AND expires_at <= ?",
+                          iso(now), iso(now + timedelta(hours=24))),
+        "links_today": q("SELECT COUNT(*) FROM audit_log WHERE ts >= ? AND action = 'link.created' "
+                         "AND outcome = 'allowed'", since),
         "events_today": q("SELECT COUNT(*) FROM audit_log WHERE ts >= ?", since),
         "denied_today": q("SELECT COUNT(*) FROM audit_log WHERE ts >= ? AND outcome = 'denied'", since),
         "downloads_today": q("SELECT COUNT(*) FROM audit_log WHERE ts >= ? AND outcome = 'allowed' AND action IN "
-                             "('document.download','document.version_download','share_link.download')", since),
+                             "('document.download','document.version_download')", since),
     }
 
 
@@ -270,9 +272,8 @@ def admin_documents(principal: Principal = Depends(admin_only), conn: sqlite3.Co
     rows = conn.execute(
         """SELECT d.id, d.name, d.category, d.created_at, d.updated_at, d.deleted_at, d.purged_at,
                   u.username AS owner_username, u.is_active AS owner_active,
-                  (SELECT COUNT(*) FROM grants g WHERE g.document_id = d.id) AS grants,
-                  (SELECT COUNT(*) FROM share_links l WHERE l.document_id = d.id AND l.revoked_at IS NULL
-                     AND l.expires_at > :now AND l.use_count < l.max_uses) AS active_links,
+                  (SELECT COUNT(*) FROM grants g WHERE g.document_id = d.id AND g.expires_at > :now) AS grants,
+                  (SELECT COUNT(*) FROM grants g WHERE g.document_id = d.id AND g.expires_at <= :now) AS expired_grants,
                   (SELECT COUNT(*) FROM document_versions v WHERE v.document_id = d.id) AS versions
            FROM documents d JOIN users u ON u.id = d.owner_id ORDER BY d.updated_at DESC""",
         {"now": now_iso()},
@@ -280,20 +281,31 @@ def admin_documents(principal: Principal = Depends(admin_only), conn: sqlite3.Co
     return {"items": [{**dict(r), "owner_active": bool(r["owner_active"])} for r in rows]}
 
 
-@router.get("/documents/{doc_id}/access", summary="Who can reach a document (admin, metadata only)")
+@router.get("/documents/{doc_id}/access", summary="Who can reach a document, and until when (admin, metadata only)")
 def admin_document_access(doc_id: str, principal: Principal = Depends(admin_only),
-                          conn: sqlite3.Connection = Depends(get_db)):
-    doc = conn.execute("SELECT id, name, owner_id FROM documents WHERE id = ?", (doc_id,)).fetchone() \
+                          conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    doc = conn.execute("SELECT id, name, owner_id, access_version FROM documents WHERE id = ?", (doc_id,)).fetchone() \
         if is_valid_id(doc_id) else None
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
+    log_expired_grants(conn, ctx.audit, document_id=doc["id"])
+    now = now_iso()
     grants = conn.execute(
         """SELECT g.id, g.permission, g.expires_at, g.created_at, g.source, u.username, u.is_active, u.is_external
-           FROM grants g JOIN users u ON u.id = g.user_id WHERE g.document_id = ?""", (doc["id"],)).fetchall()
+           FROM grants g JOIN users u ON u.id = g.user_id WHERE g.document_id = ?
+           ORDER BY g.expires_at <= ?, u.username""", (doc["id"], now)).fetchall()
     links = conn.execute(
-        """SELECT id, label, created_at, expires_at, max_uses, use_count, revoked_at FROM share_links
-           WHERE document_id = ? ORDER BY created_at DESC""", (doc["id"],)).fetchall()
-    return {"document": dict(doc), "grants": [dict(g) for g in grants], "share_links": [dict(link) for link in links]}
+        """SELECT ts, actor_name, details FROM audit_log WHERE document_id = ? AND action = 'link.created'
+           AND outcome = 'allowed' ORDER BY seq DESC LIMIT 20""", (doc["id"],)).fetchall()
+    recent_links = []
+    for r in links:
+        d = json.loads(r["details"])
+        recent_links.append({"created_at": r["ts"], "created_by": r["actor_name"], "recipient": d.get("recipient"),
+                             "permission": d.get("permission"), "expires_at": d.get("expires_at"),
+                             "live": d.get("expires_at", "") > now and d.get("access_version") == doc["access_version"]})
+    return {"document": dict(doc), "server_time": now,
+            "grants": [{**dict(g), "expired": g["expires_at"] <= now} for g in grants],
+            "recent_links": recent_links}
 
 
 @router.delete("/grants/{grant_id}", summary="Emergency revoke of any grant (admin; can only reduce access)")
@@ -304,20 +316,25 @@ def admin_revoke_grant(grant_id: str, principal: Principal = Depends(admin_only)
         raise HTTPException(status_code=404, detail="Grant not found")
     with transaction(conn) as tx:
         tx.execute("DELETE FROM grants WHERE id = ?", (grant["id"],))
-        ctx.audit.append(tx, principal.audit_ctx, "permission.revoke", "allowed", document_id=grant["document_id"],
+        tx.execute("UPDATE documents SET access_version = access_version + 1 WHERE id = ?", (grant["document_id"],))
+        ctx.audit.append(tx, principal.audit_ctx, "access.revoked", "allowed", document_id=grant["document_id"],
                          target_user_id=grant["user_id"],
-                         details={"grant_id": grant["id"], "permission": grant["permission"], "by_admin": True})
+                         details={"grant_id": grant["id"], "permission": grant["permission"],
+                                  "expires_at": grant["expires_at"], "by_admin": True})
     return {"ok": True}
 
 
-@router.post("/share-links/{link_id}/revoke", summary="Emergency revoke of any share link (admin)")
-def admin_revoke_link(link_id: str, principal: Principal = Depends(admin_only),
-                      conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
-    link = conn.execute("SELECT * FROM share_links WHERE id = ?", (link_id,)).fetchone() if is_valid_id(link_id) else None
-    if link is None:
-        raise HTTPException(status_code=404, detail="Link not found")
+@router.post("/documents/{doc_id}/links/revoke-all",
+             summary="Emergency: invalidate every outstanding share link of a document (admin; only reduces access)")
+def admin_revoke_links(doc_id: str, principal: Principal = Depends(admin_only),
+                       conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    doc = conn.execute("SELECT id, access_version FROM documents WHERE id = ?", (doc_id,)).fetchone() \
+        if is_valid_id(doc_id) else None
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
     with transaction(conn) as tx:
-        tx.execute("UPDATE share_links SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?", (now_iso(), link["id"]))
-        ctx.audit.append(tx, principal.audit_ctx, "share_link.revoke", "allowed", document_id=link["document_id"],
-                         details={"link_id": link["id"], "by_admin": True})
+        tx.execute("UPDATE documents SET access_version = access_version + 1 WHERE id = ?", (doc["id"],))
+        ctx.audit.append(tx, principal.audit_ctx, "link.revoked_all", "allowed", document_id=doc["id"],
+                         details={"from_version": doc["access_version"], "to_version": doc["access_version"] + 1,
+                                  "by_admin": True})
     return {"ok": True}

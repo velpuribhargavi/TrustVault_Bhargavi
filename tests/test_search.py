@@ -63,10 +63,11 @@ def test_trashed_document_disappears_from_grantee_search(world):
 
 
 def test_admin_search_sees_nothing_even_with_grant_row(world, db):
-    from trustvault.utils import new_id, now_iso
+    from trustvault.utils import iso_in, new_id, now_iso
     with transaction(db) as tx:
-        tx.execute("INSERT INTO grants (id, document_id, user_id, permission, granted_by, created_at) "
-                   "VALUES (?, ?, ?, 'view', ?, ?)", (new_id(), world.doc_a, world.ids["admin"], world.ids["alice"], now_iso()))
+        tx.execute("INSERT INTO grants (id, document_id, user_id, permission, granted_by, created_at, expires_at) "
+                   "VALUES (?, ?, ?, 'view', ?, ?, ?)",
+                   (new_id(), world.doc_a, world.ids["admin"], world.ids["alice"], now_iso(), iso_in(days=1)))
     assert names(world["admin"].get("/api/documents")) == set()
 
 

@@ -13,8 +13,8 @@ def test_revoked_grant_stops_the_same_session_at_once(world):
     carol = world["carol"]
     assert carol.get(f"/api/documents/{world.doc_a}/download").status_code == 200
     assert world["alice"].delete(f"/api/documents/{world.doc_a}/grants/{world.grant_carol}").status_code == 200
-    assert carol.get(f"/api/documents/{world.doc_a}/download").status_code == 404
-    assert carol.get(f"/api/documents/{world.doc_a}").status_code == 404
+    assert carol.get(f"/api/documents/{world.doc_a}/download").status_code == 403
+    assert carol.get(f"/api/documents/{world.doc_a}").status_code == 403
 
 
 def test_downgrade_from_edit_to_download_is_immediate(world):
@@ -46,8 +46,8 @@ def test_deactivated_user_is_locked_out_of_every_session_and_link(world, db):
     second_session = world.fresh("carol")
     bearer = Client(world.app)
     token = bearer.login("carol", mode="bearer").json()["token"]
-    link_token = world["alice"].post(f"/api/documents/{world.doc_a}/share-links",
-                                     json={"expires_in_hours": 1, "max_uses": 5}).json()["token"]
+    link_token = world["alice"].post(f"/api/documents/{world.doc_a}/links", json={"username": "frank"}).json()["token"]
+    assert world["frank"].post("/api/links/open", json={"token": link_token}).status_code == 200
 
     r = world["admin"].patch(f"/api/admin/users/{world.ids['carol']}", json={"is_active": False})
     assert r.status_code == 200 and r.json()["sessions_revoked"] == 3
@@ -57,9 +57,9 @@ def test_deactivated_user_is_locked_out_of_every_session_and_link(world, db):
     assert bearer.http.get("/api/documents", headers={"Authorization": f"Bearer {token}"}).status_code == 401
     assert Client(world.app).login("carol").status_code == 401
 
-    # alice leaves the company: her share link dies with her account.
+    # alice leaves the company: the link she made dies with her account.
     world["admin"].patch(f"/api/admin/users/{world.ids['alice']}", json={"is_active": False})
-    assert world.anon().post("/api/public/share/download", json={"token": link_token}).status_code == 404
+    assert world["frank"].post("/api/links/open", json={"token": link_token}).status_code == 403
 
 
 def test_inactive_user_with_surviving_session_row_is_rejected(world, db):
@@ -111,12 +111,12 @@ def test_absolute_session_lifetime(world, db):
 
 def test_trash_suspends_grants_and_restore_brings_them_back(world):
     assert world["alice"].delete(f"/api/documents/{world.doc_a}").status_code == 200
-    assert world["carol"].get(f"/api/documents/{world.doc_a}/download").status_code == 404
-    assert world["dave"].patch(f"/api/documents/{world.doc_a}", json={"name": "x"}).status_code == 404
+    assert world["carol"].get(f"/api/documents/{world.doc_a}/download").status_code == 403
+    assert world["dave"].patch(f"/api/documents/{world.doc_a}", json={"name": "x"}).status_code == 403
     # even the owner can only view / restore / purge while it is in the trash
-    assert world["alice"].get(f"/api/documents/{world.doc_a}/download").status_code == 404
+    assert world["alice"].get(f"/api/documents/{world.doc_a}/download").status_code == 403
     assert world["alice"].post(f"/api/documents/{world.doc_a}/grants",
-                               json={"username": "frank", "permission": "view"}).status_code == 404
+                               json={"username": "frank", "permission": "view"}).status_code == 403
     assert world["alice"].post(f"/api/documents/{world.doc_a}/restore").status_code == 200
     assert world["carol"].get(f"/api/documents/{world.doc_a}/download").status_code == 200
 

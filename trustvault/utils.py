@@ -17,8 +17,14 @@ _BIDI_AND_INVISIBLE = {
 }
 
 
+# Every "what time is it" in the server goes through utcnow(). The tests move
+# this offset forward to check time limits (a 5-minute link, a 30-minute grant,
+# a 15-minute idle timeout) without sleeping. Production never changes it.
+_CLOCK_OFFSET = timedelta(0)
+
+
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(timezone.utc) + _CLOCK_OFFSET
 
 
 def iso(dt: datetime) -> str:

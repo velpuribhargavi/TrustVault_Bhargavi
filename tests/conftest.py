@@ -4,12 +4,17 @@
 
     alice  (owner)   owns  DOC_A "Salary letter - Carol.pdf"  (hr)
                      gina: view    carol: download    dave: edit    erin: download but EXPIRED
+                     (the live grants use the default duration, DEFAULT_GRANT_MINUTES)
     bob    (owner)   owns  DOC_B "Bridge drawing rev B.png"   (engineering), shared with nobody
     frank  (owner)   owns nothing
     admin  (admin)
     erin is an external viewer.
 
 Every user gets their own HTTP client (own cookie jar) and is signed in.
+
+``clock`` moves the server's clock forward (utils.utcnow) so time limits -
+5-minute links, 30-minute grants, 15-minute idle sessions - are tested
+without sleeping.
 """
 from __future__ import annotations
 
@@ -18,10 +23,12 @@ import struct
 import zipfile
 import zlib
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 
+import trustvault.utils as tv_utils
 from trustvault.config import Settings
 from trustvault.db import connect, transaction
 from trustvault.main import create_app
@@ -74,10 +81,17 @@ def make_docx(extra: dict[str, bytes] | None = None, content_types: bytes | None
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", content_types or (
             b'<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            b'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            b'<Default Extension="xml" ContentType="application/xml"/>'
             b'<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.'
             b'wordprocessingml.document.main+xml"/></Types>'))
-        zf.writestr("_rels/.rels", b'<?xml version="1.0"?><Relationships/>')
-        zf.writestr("word/document.xml", b'<?xml version="1.0"?><w:document><w:body>' + body + b'</w:body></w:document>')
+        zf.writestr("_rels/.rels",
+                    b'<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+                    b'relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/'
+                    b'2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+        zf.writestr("word/document.xml",
+                    b'<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/'
+                    b'2006/main"><w:body>' + body + b'</w:body></w:document>')
         for name, data in (extra or {}).items():
             zf.writestr(name, data)
     return buf.getvalue()
@@ -139,10 +153,29 @@ def settings(tmp_path, monkeypatch):
     return Settings(
         instance_dir=tmp_path / "instance",
         argon2_time_cost=1, argon2_memory_kib=1024, argon2_parallelism=1,
-        login_rate_per_ip_per_minute=1000, public_rate_per_ip_per_minute=1000,
+        login_rate_per_ip_per_minute=1000, link_rate_per_user_per_minute=1000,
+        office_renderer="off",  # tests that need LibreOffice switch it on themselves
         max_upload_bytes=1024 * 1024,
         durable_writes=False,  # skip fsync: tests do not need power-cut durability
     )
+
+
+class Clock:
+    """Moves the server clock forward. Every server-side "now" goes through
+    trustvault.utils.utcnow(), which adds this offset."""
+
+    def __init__(self, monkeypatch):
+        self._mp = monkeypatch
+        self.offset = timedelta(0)
+
+    def advance(self, **delta) -> None:
+        self.offset += timedelta(**delta)
+        self._mp.setattr(tv_utils, "_CLOCK_OFFSET", self.offset)
+
+
+@pytest.fixture
+def clock(monkeypatch) -> Clock:
+    return Clock(monkeypatch)
 
 
 @pytest.fixture

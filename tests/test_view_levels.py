@@ -91,8 +91,8 @@ def test_page_numbers_out_of_range(world):
 
 def test_trashed_document_cannot_be_viewed_by_grantee(world):
     world["alice"].delete(f"/api/documents/{world.doc_a}")
-    assert world["gina"].get(f"/api/documents/{world.doc_a}/preview").status_code == 404
-    assert world["gina"].get(f"/api/documents/{world.doc_a}/preview/pages/1").status_code == 404
+    assert world["gina"].get(f"/api/documents/{world.doc_a}/preview").status_code == 403
+    assert world["gina"].get(f"/api/documents/{world.doc_a}/preview/pages/1").status_code == 403
 
 
 def test_image_preview_is_reencoded_without_metadata(world):

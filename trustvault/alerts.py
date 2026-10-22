@@ -21,8 +21,7 @@ PROBE_THRESHOLD = 5          # denied document requests by one user
 LOGIN_USER_THRESHOLD = 5     # failed logins for one username
 LOGIN_IP_THRESHOLD = 10      # failed logins from one IP
 BULK_THRESHOLD = 10          # distinct documents downloaded by one user
-LINK_IP_THRESHOLD = 3        # distinct IPs using one share link
-LINK_GUESS_THRESHOLD = 10    # invalid share-link tokens from one IP
+LINK_FORGERY_THRESHOLD = 3   # links with a bad signature presented by one user
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
@@ -72,8 +71,7 @@ def compute_alerts(conn: sqlite3.Connection, hours: int = 24, verify_result: dic
     failed_login_by_user = defaultdict(list)
     failed_login_by_ip = defaultdict(list)
     downloads_by_actor = defaultdict(list)
-    link_uses = defaultdict(list)
-    link_guesses_by_ip = defaultdict(list)
+    forged_links_by_actor = defaultdict(list)
 
     resets: dict[str, dict] = {}  # target user id -> the admin password-reset event
 
@@ -108,21 +106,26 @@ def compute_alerts(conn: sqlite3.Connection, hours: int = 24, verify_result: dic
         if action in ("document.download", "document.version_download", "document.preview") \
                 and outcome == "allowed" and e["actor_id"]:
             downloads_by_actor[e["actor_name"] or e["actor_id"]].append(e)
-        if action in ("document.download", "document.version_download", "share_link.download") and outcome == "error":
+        if action.startswith("document.") and outcome == "error" and d.get("reason") == "integrity":
             add("integrity_failure", "critical", "Stored file failed its integrity check",
                 f"Document {e['document_id']} could not be verified ({d.get('reason')}) - possible tampering with storage",
                 e["actor_name"], e["ts"], e["ts"], 1)
-        if action == "share_link.download" and outcome == "allowed":
-            link_uses[d.get("link_id")].append(e)
-        if action.startswith("share_link.") and outcome == "denied" and d.get("reason") == "unknown_token":
-            link_guesses_by_ip[e["ip"]].append(e)
+        # A share link only works for the person it was made for. Someone else
+        # presenting it means it was forwarded (or stolen).
+        if outcome == "denied" and (d.get("reason") == "link_wrong_recipient"
+                                    or d.get("link_problem") == "link_wrong_recipient"):
+            add("forwarded_link", "medium", "Share link used by someone it was not made for",
+                f"'{e['actor_name']}' tried to open link {d.get('link_id')} made for another person "
+                f"(document {e['document_id']}) - it may have been forwarded", e["actor_name"], e["ts"], e["ts"], 1)
+        if outcome == "denied" and d.get("reason") == "link_invalid" and e["actor_id"]:
+            forged_links_by_actor[e["actor_name"] or e["actor_id"]].append(e)
         if action == "user.create" and d.get("role") == "admin" and not d.get("seeded"):
             add("privilege_change", "high", "New administrator account created",
                 f"{e['actor_name']} created administrator '{d.get('username')}'", e["actor_name"], e["ts"], e["ts"], 1)
         if action == "user.update" and d.get("changes", {}).get("role", {}).get("to") == "admin":
             add("privilege_change", "high", "User promoted to administrator",
                 f"{e['actor_name']} promoted '{d.get('username')}' to administrator", e["actor_name"], e["ts"], e["ts"], 1)
-        if action in ("permission.grant", "permission.change") and outcome == "allowed" \
+        if action in ("access.granted", "access.changed") and outcome == "allowed" \
                 and d.get("permission") == "edit" and d.get("target_external"):
             add("external_edit_grant", "medium", "Edit access granted to an external user",
                 f"{e['actor_name']} gave '{d.get('target_username')}' edit access to document {e['document_id']}",
@@ -150,16 +153,11 @@ def compute_alerts(conn: sqlite3.Connection, hours: int = 24, verify_result: dic
             add("bulk_download", "high", "Bulk download",
                 f"'{actor}' downloaded or opened {hit[2]} different documents within 10 minutes - possible exfiltration",
                 actor, hit[0], hit[1], hit[2])
-    for link_id, evs in link_uses.items():
-        ips = {e["ip"] for e in evs}
-        if len(ips) >= LINK_IP_THRESHOLD:
-            add("share_link_spread", "medium", "Share link used from several addresses",
-                f"Share link {link_id} was used from {len(ips)} different IP addresses - it may have been forwarded",
-                None, evs[0]["ts"], evs[-1]["ts"], len(ips))
-    for ip, evs in link_guesses_by_ip.items():
-        if len(evs) >= LINK_GUESS_THRESHOLD:
-            add("share_link_guessing", "high", "Invalid share-link tokens",
-                f"{len(evs)} invalid share-link tokens tried from {ip}", ip, evs[0]["ts"], evs[-1]["ts"], len(evs))
+    for actor, evs in forged_links_by_actor.items():
+        if len(evs) >= LINK_FORGERY_THRESHOLD:
+            add("link_tampering", "high", "Tampered or made-up share links",
+                f"'{actor}' presented {len(evs)} share links whose signature does not match - "
+                "someone is editing or guessing link tokens", actor, evs[0]["ts"], evs[-1]["ts"], len(evs))
 
     alerts.sort(key=lambda a: a["last_seen"] or "", reverse=True)       # newest first...
     alerts.sort(key=lambda a: SEVERITY_ORDER.get(a["severity"], 9))     # ...within each severity (stable sort)

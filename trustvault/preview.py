@@ -7,8 +7,10 @@ sends a rendering:
 * PDF        -> one PNG per page, rendered with PDFium (pypdfium2)
 * PNG / JPEG -> a re-encoded PNG (EXIF and other metadata dropped)
 * TXT / CSV  -> the text
-* DOCX / PPTX / XLSX -> the text, extracted with regular expressions over the
-  XML parts (no XML parser, so no entity-expansion tricks)
+* DOCX / PPTX / XLSX -> page images, when LibreOffice is installed: the file is
+  converted to PDF on the server (``OfficeRenderer``) and rendered like a PDF.
+  Without LibreOffice: the text, extracted with regular expressions over the
+  XML parts (no XML parser, so no entity-expansion tricks).
 
 Every rendered image carries a tiled watermark plus a footer with the
 viewer's username and the time; text previews carry the same watermark line.
@@ -22,9 +24,15 @@ from __future__ import annotations
 
 import html
 import io
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import threading
 import zipfile
+from collections import OrderedDict
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -38,6 +46,7 @@ Image.MAX_IMAGE_PIXELS = 40_000_000  # same limit as upload validation
 
 PAGE_TYPES = {"pdf", "png", "jpg", "jpeg"}
 TEXT_TYPES = {"txt", "csv", "docx", "pptx", "xlsx"}
+OFFICE_TYPES = {"docx", "pptx", "xlsx"}  # rendered as pages when LibreOffice is available
 
 # PDFium is not thread-safe; FastAPI runs sync endpoints in a thread pool.
 _pdfium_lock = threading.Lock()
@@ -260,3 +269,88 @@ def _xlsx_text(zf: zipfile.ZipFile, names: list[str]) -> str:
             rows_out.append("\t".join(cells))
         out.append(f"--- {title} ---\n" + "\n".join(rows_out))
     return "\n\n".join(out).strip()
+
+
+# ------------------------------------------------------- Office -> PDF pages
+_WINDOWS_SOFFICE = [Path(os.environ.get(var, "")) / "LibreOffice" / "program" / "soffice.exe"
+                    for var in ("ProgramFiles", "ProgramFiles(x86)") if os.environ.get(var)]
+MAX_OFFICE_PDF_BYTES = 50 * 1024 * 1024
+
+
+def find_soffice(setting: str) -> str | None:
+    """Resolve the OFFICE_RENDERER setting: 'off', 'auto' or a path to soffice."""
+    setting = (setting or "auto").strip()
+    if setting.lower() == "off":
+        return None
+    if setting.lower() != "auto":
+        return setting if Path(setting).is_file() else None
+    for name in ("soffice", "libreoffice"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for candidate in _WINDOWS_SOFFICE:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+class OfficeRenderer:
+    """Converts Word / PowerPoint / Excel to PDF with LibreOffice, so a view-only
+    reader sees real pages (layout, tables, images) instead of bare text.
+
+    Safety: the file is written to a private temporary folder and converted by
+    a separate ``soffice --headless`` process with its own throw-away profile,
+    a time limit, no network use and no macros (macro-enabled files are already
+    refused at upload). One conversion runs at a time. The PDF stays in memory
+    only (a small cache keyed by version id) and is never sent to the browser:
+    it is rendered to watermarked PNGs like any other PDF.
+    """
+
+    CACHE_ENTRIES = 8
+
+    def __init__(self, soffice: str | None, timeout_seconds: int = 60):
+        self.soffice = soffice
+        self.timeout = timeout_seconds
+        self._cache: OrderedDict[str, bytes] = OrderedDict()
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_settings(cls, settings) -> "OfficeRenderer":
+        return cls(find_soffice(settings.office_renderer), settings.office_render_timeout_seconds)
+
+    @property
+    def available(self) -> bool:
+        return self.soffice is not None
+
+    def pdf_for(self, version_id: str, extension: str, data: bytes) -> bytes:
+        if extension not in OFFICE_TYPES or not self.available:
+            raise PreviewError("no Office renderer")
+        with self._lock:  # one LibreOffice at a time; also guards the cache
+            cached = self._cache.get(version_id)
+            if cached is not None:
+                self._cache.move_to_end(version_id)
+                return cached
+            pdf = self._convert(extension, data)
+            self._cache[version_id] = pdf
+            while len(self._cache) > self.CACHE_ENTRIES:
+                self._cache.popitem(last=False)
+            return pdf
+
+    def _convert(self, extension: str, data: bytes) -> bytes:
+        with tempfile.TemporaryDirectory(prefix="tv-office-") as tmp:
+            folder = Path(tmp)
+            source = folder / f"document.{extension}"
+            source.write_bytes(data)
+            env = dict(os.environ, HOME=tmp)  # keep LibreOffice's files out of the user's home
+            cmd = [self.soffice, f"-env:UserInstallation={(folder / 'profile').as_uri()}", "--headless",
+                   "--invisible", "--norestore", "--nologo", "--nodefault", "--nolockcheck",
+                   "--convert-to", "pdf", "--outdir", str(folder), str(source)]
+            try:
+                subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=self.timeout, check=False, env=env, cwd=tmp)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise PreviewError("Office document could not be converted") from exc
+            out = folder / "document.pdf"
+            if not out.is_file() or out.stat().st_size == 0 or out.stat().st_size > MAX_OFFICE_PDF_BYTES:
+                raise PreviewError("Office document could not be converted")
+            return out.read_bytes()

@@ -1,5 +1,5 @@
 """Administrator powers and their limits, and the alert rules.
-THREATS.md: T07, T46."""
+THREATS.md: T07, T46, T66."""
 from __future__ import annotations
 
 import pytest
@@ -29,27 +29,34 @@ def test_admin_sees_metadata_but_never_content(world):
     assert {d["name"] for d in docs} == {"Salary letter - Carol.pdf", "Bridge drawing rev B.png"}
     access = admin.get(f"/api/admin/documents/{world.doc_a}/access").json()
     assert {g["username"] for g in access["grants"]} == {"carol", "dave", "erin", "gina"}
-    assert admin.get(f"/api/documents/{world.doc_a}/download").status_code == 404
-    assert admin.get(f"/api/documents/{world.doc_a}/versions/{world.version_a1}/download").status_code == 404
+    assert {g["username"] for g in access["grants"] if g["expired"]} == {"erin"}
+    assert admin.get(f"/api/documents/{world.doc_a}/download").status_code == 403
+    assert admin.get(f"/api/documents/{world.doc_a}/versions/{world.version_a1}/download").status_code == 403
 
 
 def test_admin_cannot_grant_and_cannot_be_granted(world):
     assert world["admin"].post(f"/api/documents/{world.doc_a}/grants",
-                               json={"username": "admin", "permission": "view"}).status_code == 404
+                               json={"username": "admin", "permission": "view"}).status_code == 403
     r = world["alice"].post(f"/api/documents/{world.doc_a}/grants", json={"username": "admin", "permission": "view"})
     assert r.status_code == 400
+    r = world["alice"].post(f"/api/documents/{world.doc_a}/links", json={"username": "admin"})
+    assert r.status_code == 400  # no share link for an admin either
 
 
 def test_admin_emergency_revoke_is_reduce_only(world, db):
     assert world["admin"].delete(f"/api/admin/grants/{world.grant_carol}").status_code == 200
-    assert world["carol"].get(f"/api/documents/{world.doc_a}").status_code == 404
+    assert world["carol"].get(f"/api/documents/{world.doc_a}").status_code == 403
+    row = db.execute("SELECT details FROM audit_log WHERE action = 'access.revoked' ORDER BY seq DESC").fetchone()
+    assert '"by_admin":true' in row[0]
 
 
-def test_admin_can_revoke_any_share_link(world):
-    link = world["alice"].post(f"/api/documents/{world.doc_a}/share-links",
-                               json={"expires_in_hours": 1, "max_uses": 2}).json()
-    assert world["admin"].post(f"/api/admin/share-links/{link['id']}/revoke").status_code == 200
-    assert world.anon().post("/api/public/share/info", json={"token": link["token"]}).status_code == 404
+def test_admin_can_kill_every_share_link_of_a_document(world):
+    link = world["alice"].post(f"/api/documents/{world.doc_a}/links", json={"username": "frank"}).json()
+    frank = world["frank"]
+    assert frank.post("/api/links/open", json={"token": link["token"]}).status_code == 200
+    assert world["admin"].post(f"/api/admin/documents/{world.doc_a}/links/revoke-all").status_code == 200
+    assert frank.post("/api/links/open", json={"token": link["token"]}).status_code == 403
+    assert world["alice"].post(f"/api/admin/documents/{world.doc_a}/links/revoke-all").status_code == 403
 
 
 def test_admin_cannot_lock_themselves_out(world, db):
@@ -143,16 +150,21 @@ def test_alert_on_bulk_download(world, db):
 
 def test_alert_on_credential_stuffing_and_guessing(world, db):
     _emit(world, db, 6, "auth.login", "denied", actor=(None, "carol"), details={"reason": "bad_password"})
-    _emit(world, db, 11, "share_link.download", "denied", actor=(None, "share-link:unknown"),
-          details={"reason": "unknown_token"})
+    _emit(world, db, 11, "auth.login", "denied", actor=(None, "someone"), ip="6.6.6.6",
+          details={"reason": "unknown_user"})
     got = rules(db, world)
-    assert "password_guessing" in got and "share_link_guessing" in got
+    assert "password_guessing" in got and "credential_stuffing" in got
 
 
-def test_alert_on_link_used_from_many_addresses(world, db):
-    _emit(world, db, 3, "share_link.download", "allowed", actor=(None, "share-link:x"),
-          ip=["10.0.0.1", "10.0.0.2", "10.0.0.3"], details={"link_id": "L1"})
-    assert "share_link_spread" in rules(db, world)
+def test_alert_on_forwarded_and_tampered_links(world, db):
+    link = world["alice"].post(f"/api/documents/{world.doc_a}/links", json={"username": "frank"}).json()
+    assert world["bob"].post("/api/links/open", json={"token": link["token"]}).status_code == 403
+    assert "forwarded_link" in rules(db, world)
+    head, body, sig = link["token"].split(".")
+    for i in range(3):
+        forged = f"{head}.{body}.{'B' * (len(sig) - 1)}{i}"
+        assert world["bob"].post("/api/links/open", json={"token": forged}).status_code == 403
+    assert "link_tampering" in rules(db, world)
 
 
 def test_alert_on_new_admin_and_external_edit(world, db):

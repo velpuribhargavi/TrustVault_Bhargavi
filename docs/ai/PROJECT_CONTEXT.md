@@ -10,14 +10,20 @@ whether a hostile tester can reach a document they were not granted.
 
 Non-negotiable rules - do not change these, and stop and tell me if a request would:
 
-1. **Every document route calls `authz.authorize()` first.** No route reads a
-   document, version, grant, link or suggestion by id without first authorising
-   the parent document *and* checking the child belongs to it.
-2. **Admins never get document content.** Not via a grant, not via a special
-   endpoint, not "for support". Admins can only reduce access.
-3. **No caching of permissions, no JWTs, no pre-signed URLs.** Revocation must
-   work on the next request.
-4. **No access = 404**, same as "does not exist". Insufficient level = 403.
+1. **Every document route calls `authz.require_access()` as its first statement.**
+   `check_access()` is the only function that decides document access; nothing
+   else may call it or re-implement it. No route reads a version, grant or
+   suggestion by id without checking the child belongs to the checked document.
+2. **Admins never get document content.** Not via a grant, a link, a special
+   endpoint, or "for support". Admins can only reduce access.
+3. **No caching of permissions, no JWTs, no anonymous links.** Revocation must
+   work on the next request. The only signed token is a share link: one named
+   recipient, `LINK_TTL_SECONDS`, checked against `documents.access_version`.
+4. **Every refusal is the same 403 "You don't have access to this file."** with
+   `code: no_access`. The real reason goes to the audit trail only.
+4b. **Every time limit lives in `config.py`** (LINK_TTL_SECONDS, DEFAULT_GRANT_MINUTES,
+   SESSION_IDLE_MINUTES, SESSION_MAX_HOURS). Every clock read goes through
+   `utils.utcnow()` so tests can move time. Every grant expires.
 5. **Every refusal writes a `denied` audit row**; every allowed access writes an
    `allowed` row *before* bytes are returned. If the audit write fails, the
    request fails.

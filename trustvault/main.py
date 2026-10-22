@@ -17,9 +17,13 @@ from .context import AppContext
 from .db import connect, init_schema
 from .deps import Principal, current_principal
 from .middleware import BodySizeLimitMiddleware, SecurityHeadersMiddleware
-from .routes import admin, auth, documents, public, sharing
+from .audit import AuditContext
+from .db import transaction
+from .deps import session_end_reason
+from .expiry import log_expired_grants
+from .routes import admin, auth, documents, sharing
 from .services import purge_expired_trash
-from .utils import now_iso
+from .utils import utcnow
 from .validation import ALLOWED_TYPES, CATEGORIES
 
 log = logging.getLogger("trustvault")
@@ -32,10 +36,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     init_schema(settings.db_path, durable=settings.durable_writes)
     ctx = AppContext.build(settings, create_keys=first_run)
 
-    # Housekeeping at start-up: expired sessions and trash past retention.
+    # Housekeeping at start-up: sessions that ended while the server was down,
+    # grants that expired while it was down, and trash past retention.
     conn = connect(settings.db_path, durable=settings.durable_writes)
     try:
-        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_iso(),))
+        end_stale_sessions(conn, ctx)
+        log_expired_grants(conn, ctx.audit)
         purge_expired_trash(conn, ctx)
     finally:
         conn.close()
@@ -57,7 +63,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(request: Request, exc: StarletteHTTPException):
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=getattr(exc, "headers", None))
+        body = {"detail": exc.detail}
+        if getattr(exc, "code", None):  # errors.CodedHTTPException: no_access, session_expired
+            body["code"] = exc.code
+        return JSONResponse(body, status_code=exc.status_code, headers=getattr(exc, "headers", None))
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
@@ -72,15 +81,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         log.exception("Unhandled error %s on %s %s", incident, request.method, request.url.path)
         return JSONResponse({"detail": "Internal error", "incident": incident}, status_code=500)
 
-    for module in (auth, documents, sharing, public, admin):
+    for module in (auth, documents, sharing, admin):
         app.include_router(module.router)
 
-    @app.get("/api/meta", tags=["meta"], summary="Categories and upload limits (any signed-in user)")
+    @app.get("/api/meta", tags=["meta"], summary="Categories, upload limits and time limits (any signed-in user)")
     def meta(principal: Principal = Depends(current_principal)):
         return {"categories": list(CATEGORIES), "allowed_extensions": sorted(ALLOWED_TYPES),
                 "max_upload_bytes": settings.max_upload_bytes,
-                "share_link_max_hours": settings.share_link_max_hours,
-                "share_link_max_uses": settings.share_link_max_uses}
+                "link_ttl_seconds": settings.link_ttl_seconds,
+                "default_grant_minutes": settings.default_grant_minutes,
+                "max_grant_days": settings.max_grant_days,
+                "session_idle_minutes": settings.session_idle_minutes,
+                "session_max_hours": settings.session_absolute_hours,
+                "session_warning_seconds": settings.session_warning_seconds,
+                "office_renderer": "libreoffice" if ctx.office.available else "text"}
 
     @app.get("/api/health", tags=["meta"], summary="Liveness probe (anyone)")
     def health():
@@ -92,8 +106,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def index():
         return FileResponse(STATIC_DIR / "index.html")
 
-    @app.get("/share", include_in_schema=False)
-    def share_page():
-        return FileResponse(STATIC_DIR / "share.html")
-
     return app
+
+
+def end_stale_sessions(conn, ctx: AppContext) -> int:
+    """Remove sessions that hit the idle or absolute limit while nobody used
+    them, recording each as auth.session_expired."""
+    now = utcnow()
+    rows = conn.execute("""SELECT s.token_hash, s.created_at, s.last_seen_at, s.expires_at, u.id, u.username
+                           FROM sessions s JOIN users u ON u.id = s.user_id""").fetchall()
+    ended = 0
+    for row in rows:
+        reason = session_end_reason(ctx, row, now)
+        if reason is None:
+            continue
+        with transaction(conn) as tx:
+            if tx.execute("DELETE FROM sessions WHERE token_hash = ?", (row["token_hash"],)).rowcount:
+                ctx.audit.append(tx, AuditContext(row["id"], row["username"], None, None), "auth.session_expired",
+                                 "info", details={"reason": reason, "last_seen_at": row["last_seen_at"],
+                                                  "signed_in_at": row["created_at"], "detected": "start-up"})
+                ended += 1
+    return ended

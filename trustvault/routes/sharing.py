@@ -1,25 +1,32 @@
-"""Sharing: per-person grants, external share links, access suggestions and
-the user directory owners pick people from."""
+"""Sharing: time-limited grants, 5-minute share links, access suggestions and
+the user directory owners pick people from.
+
+Audit events written here
+    access.granted / access.changed / access.extended / access.revoked
+        (access.expired is written by expiry.py when a grant runs out)
+    link.created / link.opened / link.revoked_all
+    ai.suggestion.generated / .accepted / .dismissed
+"""
 from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from ..authz import Action, authorize
+from ..authz import _RANK, Action, Decision, record_denial, require_access
 from ..context import AppContext
 from ..db import transaction
 from ..deps import Principal, app_ctx, current_principal, get_db, require_role
-from ..models import GrantRequest, ShareLinkRequest
-from ..security import hash_token, new_token
+from ..errors import no_access
+from ..expiry import log_expired_grants
+from ..links import BadLink, issue, verify_signature
+from ..models import ExtendGrantRequest, GrantRequest, LinkOpenRequest, LinkRequest
 from ..suggestions import suggest_readers
-from ..utils import clean_line, is_valid_id, iso, new_id, now_iso, utcnow
+from ..utils import is_valid_id, iso, new_id, now_iso, parse_iso, utcnow
 
 router = APIRouter(tags=["sharing"])
-
-MAX_GRANT_DAYS = 366
 
 
 # ---------------------------------------------------------------- directory --
@@ -34,38 +41,61 @@ def user_directory(principal: Principal = Depends(require_role("owner")), conn: 
 
 
 # ------------------------------------------------------------------- grants --
-@router.get("/api/documents/{doc_id}/grants", summary="Who has access (owner only)")
+def _grant_expiry(ctx: AppContext, body: GrantRequest) -> str:
+    """Every grant expires. Default: DEFAULT_GRANT_MINUTES from now."""
+    now = utcnow()
+    limit = now + timedelta(days=ctx.settings.max_grant_days)
+    if body.duration_minutes is not None and body.expires_at is not None:
+        raise HTTPException(status_code=400, detail="Send either duration_minutes or expires_at, not both")
+    if body.expires_at is not None:
+        exp = body.expires_at if body.expires_at.tzinfo else body.expires_at.replace(tzinfo=timezone.utc)
+    else:
+        exp = now + timedelta(minutes=body.duration_minutes or ctx.settings.default_grant_minutes)
+    if exp <= now:
+        raise HTTPException(status_code=400, detail="Expiry must be in the future")
+    if exp > limit:
+        raise HTTPException(status_code=400, detail=f"Access can be given for at most {ctx.settings.max_grant_days} days")
+    return iso(exp)
+
+
+def _grant_out(row: dict, now: str) -> dict:
+    item = dict(row)
+    for key in ("is_external", "is_active"):
+        if key in item:
+            item[key] = bool(item[key])
+    item["expired"] = item["expires_at"] <= now
+    item["seconds_left"] = max(0, int((parse_iso(item["expires_at"]) - parse_iso(now)).total_seconds()))
+    item.pop("expiry_logged_at", None)
+    return item
+
+
+@router.get("/api/documents/{doc_id}/grants", summary="Who has access, and until when (owner only)")
 def list_grants(doc_id: str, principal: Principal = Depends(current_principal),
                 conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
-    doc = authorize(conn, ctx.audit, principal.audit_ctx, principal.user, doc_id, Action.SHARE)
+    doc = require_access(conn, ctx, principal, doc_id, Action.SHARE, audit_action="access.list").doc
+    log_expired_grants(conn, ctx.audit, document_id=doc["id"])
     rows = conn.execute(
         """SELECT g.id, g.permission, g.created_at, g.expires_at, g.source,
                   u.id AS user_id, u.username, u.display_name, u.is_external, u.is_active,
                   gb.username AS granted_by
            FROM grants g JOIN users u ON u.id = g.user_id JOIN users gb ON gb.id = g.granted_by
-           WHERE g.document_id = ? ORDER BY u.display_name COLLATE NOCASE""",
-        (doc["id"],),
+           WHERE g.document_id = ? ORDER BY g.expires_at <= ?, u.display_name COLLATE NOCASE""",
+        (doc["id"], now_iso()),
     ).fetchall()
     now = now_iso()
-    items = []
-    for r in rows:
-        item = dict(r)
-        item["is_external"] = bool(item["is_external"])
-        item["is_active"] = bool(item["is_active"])
-        item["expired"] = bool(item["expires_at"] and item["expires_at"] <= now)
-        items.append(item)
-    return {"items": items}
+    return {"items": [_grant_out(dict(r), now) for r in rows], "server_time": now,
+            "default_grant_minutes": ctx.settings.default_grant_minutes}
 
 
 @router.post("/api/documents/{doc_id}/grants", status_code=201,
-             summary="Grant or change a person's access (owner only)")
+             summary="Give or change a person's access, for a limited time (owner only)")
 def grant_access(doc_id: str, body: GrantRequest, principal: Principal = Depends(current_principal),
                  conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
-    doc = authorize(conn, ctx.audit, principal.audit_ctx, principal.user, doc_id, Action.SHARE)
+    doc = require_access(conn, ctx, principal, doc_id, Action.SHARE, audit_action="access.granted").doc
 
     def refuse(status: int, message: str, reason: str, target_id: str | None = None):
         with transaction(conn) as tx:
-            ctx.audit.append(tx, principal.audit_ctx, "permission.grant", "denied", document_id=doc["id"],
+            ctx.audit.append(tx, principal.audit_ctx, "access.granted", "denied", document_id=doc["id"],
                              target_user_id=target_id, details={"reason": reason, "username": body.username[:64]})
         raise HTTPException(status_code=status, detail=message)
 
@@ -79,14 +109,10 @@ def grant_access(doc_id: str, body: GrantRequest, principal: Principal = Depends
     if target["role"] == "admin":  # AUTHZ-CHECK[grant-target-not-admin]
         refuse(400, "Administrators cannot be given document access (separation of duties)", "target_admin", target["id"])
 
-    expires_at = None
-    if body.expires_at is not None:
-        exp = body.expires_at if body.expires_at.tzinfo else body.expires_at.replace(tzinfo=timezone.utc)
-        if exp <= utcnow():
-            raise HTTPException(status_code=400, detail="Expiry must be in the future")
-        if exp > utcnow() + timedelta(days=MAX_GRANT_DAYS):
-            raise HTTPException(status_code=400, detail=f"Expiry must be within {MAX_GRANT_DAYS} days")
-        expires_at = iso(exp)
+    try:
+        expires_at = _grant_expiry(ctx, body)
+    except HTTPException as exc:
+        refuse(exc.status_code, exc.detail, "invalid_duration", target["id"])
 
     suggestion = None
     if body.suggestion_id is not None:
@@ -99,25 +125,34 @@ def grant_access(doc_id: str, body: GrantRequest, principal: Principal = Depends
 
     existing = conn.execute("SELECT * FROM grants WHERE document_id = ? AND user_id = ?",
                             (doc["id"], target["id"])).fetchone()
+    now = now_iso()
     source = "suggestion" if suggestion else "manual"
     details = {"permission": body.permission, "expires_at": expires_at, "target_username": target["username"],
                "target_external": bool(target["is_external"]), "source": source}
     with transaction(conn) as tx:
         if existing:
-            tx.execute("UPDATE grants SET permission = ?, expires_at = ?, granted_by = ?, source = ? WHERE id = ?",
+            live = existing["expires_at"] > now
+            tx.execute("""UPDATE grants SET permission = ?, expires_at = ?, expiry_logged_at = NULL, granted_by = ?,
+                          source = ? WHERE id = ?""",
                        (body.permission, expires_at, principal.id, source, existing["id"]))
-            grant_id, action = existing["id"], "permission.change"
-            details["previous"] = {"permission": existing["permission"], "expires_at": existing["expires_at"]}
+            grant_id = existing["id"]
+            action = "access.changed" if live else "access.granted"
+            details["previous"] = {"permission": existing["permission"], "expires_at": existing["expires_at"],
+                                   "was_expired": not live}
+            # Lowering a level also kills any share link already issued for this document.
+            if live and _RANK[body.permission] < _RANK[existing["permission"]]:
+                tx.execute("UPDATE documents SET access_version = access_version + 1 WHERE id = ?", (doc["id"],))
+                details["links_invalidated"] = True
         else:
-            grant_id, action = new_id(), "permission.grant"
+            grant_id, action = new_id(), "access.granted"
             tx.execute(
                 """INSERT INTO grants (id, document_id, user_id, permission, granted_by, created_at, expires_at, source)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (grant_id, doc["id"], target["id"], body.permission, principal.id, now_iso(), expires_at, source),
+                (grant_id, doc["id"], target["id"], body.permission, principal.id, now, expires_at, source),
             )
         if suggestion:
             tx.execute("UPDATE suggestions SET status = 'accepted', decided_at = ? WHERE id = ?",
-                       (now_iso(), suggestion["id"]))
+                       (now, suggestion["id"]))
             details["suggestion_id"] = suggestion["id"]
             details["suggested_permission"] = suggestion["permission"]
             ctx.audit.append(tx, principal.audit_ctx, "ai.suggestion.accepted", "allowed", document_id=doc["id"],
@@ -127,95 +162,170 @@ def grant_access(doc_id: str, body: GrantRequest, principal: Principal = Depends
         details["grant_id"] = grant_id
         ctx.audit.append(tx, principal.audit_ctx, action, "allowed", document_id=doc["id"],
                          target_user_id=target["id"], details=details)
-    return {"id": grant_id, "permission": body.permission, "expires_at": expires_at, "source": source}
+    return {"id": grant_id, "permission": body.permission, "expires_at": expires_at, "source": source,
+            "server_time": now}
+
+
+def _grant_of_document(conn, ctx: AppContext, principal: Principal, doc: dict, grant_id: str,
+                       audit_action: str) -> dict:
+    """Load a grant id and make sure it belongs to the document just checked."""
+    grant = conn.execute("SELECT * FROM grants WHERE id = ?", (grant_id,)).fetchone() if is_valid_id(grant_id) else None
+    if grant is None or grant["document_id"] != doc["id"]:  # AUTHZ-CHECK[grant-belongs-to-document]
+        with transaction(conn) as tx:
+            ctx.audit.append(tx, principal.audit_ctx, audit_action, "denied", document_id=doc["id"],
+                             details={"reason": "grant_not_in_document", "grant_id": grant_id[:64]})
+        raise HTTPException(status_code=404, detail="Grant not found")
+    return dict(grant)
+
+
+@router.post("/api/documents/{doc_id}/grants/{grant_id}/extend",
+             summary="Add time to a grant - also revives an expired one (owner only)")
+def extend_grant(doc_id: str, grant_id: str, body: ExtendGrantRequest, principal: Principal = Depends(current_principal),
+                 conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    doc = require_access(conn, ctx, principal, doc_id, Action.SHARE, audit_action="access.extended").doc
+    grant = _grant_of_document(conn, ctx, principal, doc, grant_id, "access.extended")
+    target = conn.execute("SELECT username, is_active, role FROM users WHERE id = ?", (grant["user_id"],)).fetchone()
+
+    def refuse(message: str, reason: str):
+        with transaction(conn) as tx:
+            ctx.audit.append(tx, principal.audit_ctx, "access.extended", "denied", document_id=doc["id"],
+                             target_user_id=grant["user_id"],
+                             details={"reason": reason, "grant_id": grant["id"], "minutes": body.minutes})
+        raise HTTPException(status_code=400, detail=message)
+
+    if not target["is_active"]:
+        refuse("That account is deactivated", "target_inactive")
+    now = utcnow()
+    start = max(now, parse_iso(grant["expires_at"]))
+    new_expiry = start + timedelta(minutes=body.minutes)
+    if new_expiry > now + timedelta(days=ctx.settings.max_grant_days):
+        refuse(f"Access can be given for at most {ctx.settings.max_grant_days} days", "invalid_duration")
+    with transaction(conn) as tx:
+        tx.execute("UPDATE grants SET expires_at = ?, expiry_logged_at = NULL WHERE id = ?", (iso(new_expiry), grant["id"]))
+        ctx.audit.append(tx, principal.audit_ctx, "access.extended", "allowed", document_id=doc["id"],
+                         target_user_id=grant["user_id"],
+                         details={"grant_id": grant["id"], "permission": grant["permission"],
+                                  "from": grant["expires_at"], "to": iso(new_expiry), "added_minutes": body.minutes,
+                                  "was_expired": grant["expires_at"] <= iso(now), "target_username": target["username"]})
+    return {"id": grant["id"], "expires_at": iso(new_expiry), "server_time": iso(now)}
 
 
 @router.delete("/api/documents/{doc_id}/grants/{grant_id}", summary="Revoke a grant (owner only). Immediate.")
 def revoke_grant(doc_id: str, grant_id: str, principal: Principal = Depends(current_principal),
                  conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
-    doc = authorize(conn, ctx.audit, principal.audit_ctx, principal.user, doc_id, Action.SHARE)
-    grant = conn.execute("SELECT * FROM grants WHERE id = ?", (grant_id,)).fetchone() if is_valid_id(grant_id) else None
-    if grant is None or grant["document_id"] != doc["id"]:  # AUTHZ-CHECK[grant-belongs-to-document]
-        with transaction(conn) as tx:
-            ctx.audit.append(tx, principal.audit_ctx, "permission.revoke", "denied", document_id=doc["id"],
-                             details={"reason": "grant_not_in_document", "grant_id": grant_id[:64]})
-        raise HTTPException(status_code=404, detail="Grant not found")
+    doc = require_access(conn, ctx, principal, doc_id, Action.SHARE, audit_action="access.revoked").doc
+    grant = _grant_of_document(conn, ctx, principal, doc, grant_id, "access.revoked")
     target = conn.execute("SELECT username FROM users WHERE id = ?", (grant["user_id"],)).fetchone()
     with transaction(conn) as tx:
         tx.execute("DELETE FROM grants WHERE id = ?", (grant["id"],))
-        ctx.audit.append(tx, principal.audit_ctx, "permission.revoke", "allowed", document_id=doc["id"],
+        # Any share link already issued for this document dies with it.
+        tx.execute("UPDATE documents SET access_version = access_version + 1 WHERE id = ?", (doc["id"],))
+        ctx.audit.append(tx, principal.audit_ctx, "access.revoked", "allowed", document_id=doc["id"],
                          target_user_id=grant["user_id"],
                          details={"grant_id": grant["id"], "permission": grant["permission"],
-                                  "target_username": target["username"]})
+                                  "expires_at": grant["expires_at"], "target_username": target["username"]})
     return {"ok": True}
 
 
 # -------------------------------------------------------------- share links --
-def _link_public(row: dict) -> dict:
-    now = now_iso()
-    status = "active"
-    if row["revoked_at"]:
-        status = "revoked"
-    elif row["expires_at"] <= now:
-        status = "expired"
-    elif row["use_count"] >= row["max_uses"]:
-        status = "used_up"
-    return {"id": row["id"], "label": row["label"], "created_at": row["created_at"], "expires_at": row["expires_at"],
-            "max_uses": row["max_uses"], "use_count": row["use_count"], "revoked_at": row["revoked_at"],
-            "status": status}
+@router.post("/api/documents/{doc_id}/links", status_code=201,
+             summary="Make a signed share link for one named person, valid LINK_TTL_SECONDS (owner only)")
+def create_link(doc_id: str, body: LinkRequest, principal: Principal = Depends(current_principal),
+                conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    doc = require_access(conn, ctx, principal, doc_id, Action.SHARE, audit_action="link.created").doc
+
+    def refuse(status: int, message: str, reason: str, target_id: str | None = None):
+        with transaction(conn) as tx:
+            ctx.audit.append(tx, principal.audit_ctx, "link.created", "denied", document_id=doc["id"],
+                             target_user_id=target_id, details={"reason": reason, "username": body.username[:64]})
+        raise HTTPException(status_code=status, detail=message)
+
+    target = conn.execute("SELECT * FROM users WHERE username = ?", (body.username,)).fetchone()
+    if target is None:
+        refuse(404, "No such user", "unknown_user")
+    if target["id"] == doc["owner_id"]:
+        refuse(400, "You already own this document", "target_is_owner", target["id"])
+    if not target["is_active"]:  # AUTHZ-CHECK[link-recipient-must-be-active]
+        refuse(400, "That account is deactivated", "target_inactive", target["id"])
+    if target["role"] == "admin":  # AUTHZ-CHECK[link-recipient-not-admin]
+        refuse(400, "Administrators cannot be given document access (separation of duties)", "target_admin", target["id"])
+
+    now = utcnow()
+    token, claims = issue(ctx.keyring, document_id=doc["id"], recipient_id=target["id"], creator_id=principal.id,
+                          permission=body.permission, access_version=doc["access_version"],
+                          now_ts=int(now.timestamp()), ttl_seconds=ctx.settings.link_ttl_seconds)
+    expires_at = iso(datetime.fromtimestamp(claims.expires_at, tz=timezone.utc))
+    with transaction(conn) as tx:
+        ctx.audit.append(tx, principal.audit_ctx, "link.created", "allowed", document_id=doc["id"],
+                         target_user_id=target["id"],
+                         details={"link_id": claims.link_id, "permission": body.permission,
+                                  "recipient": target["username"], "expires_at": expires_at,
+                                  "access_version": doc["access_version"], "ttl_seconds": ctx.settings.link_ttl_seconds})
+    # The token goes in the URL *fragment*: browsers never send it to the server
+    # in the page request, so it stays out of access logs and Referer headers.
+    return {"link_id": claims.link_id, "token": token, "path": f"/#/l/{token}", "recipient": target["username"],
+            "permission": body.permission, "expires_at": expires_at, "ttl_seconds": ctx.settings.link_ttl_seconds,
+            "server_time": iso(now)}
 
 
-@router.get("/api/documents/{doc_id}/share-links", summary="External share links (owner only)")
+@router.get("/api/documents/{doc_id}/links", summary="Links made in the last few minutes and their state (owner only)")
 def list_links(doc_id: str, principal: Principal = Depends(current_principal),
                conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
-    doc = authorize(conn, ctx.audit, principal.audit_ctx, principal.user, doc_id, Action.SHARE)
-    rows = conn.execute("SELECT * FROM share_links WHERE document_id = ? ORDER BY created_at DESC", (doc["id"],)).fetchall()
-    return {"items": [_link_public(dict(r)) for r in rows]}
+    doc = require_access(conn, ctx, principal, doc_id, Action.SHARE, audit_action="link.list").doc
+    now = utcnow()
+    since = iso(now - timedelta(seconds=ctx.settings.link_ttl_seconds * 3))
+    # Links are not stored; the audit trail is the record of what was issued.
+    rows = conn.execute(
+        """SELECT ts, details FROM audit_log WHERE document_id = ? AND action = 'link.created'
+           AND outcome = 'allowed' AND ts >= ? ORDER BY seq DESC LIMIT 50""", (doc["id"], since)).fetchall()
+    opened = {json.loads(r["details"]).get("link_id") for r in conn.execute(
+        """SELECT details FROM audit_log WHERE document_id = ? AND action = 'link.opened'
+           AND outcome = 'allowed' AND ts >= ?""", (doc["id"], since))}
+    items = []
+    for r in rows:
+        d = json.loads(r["details"])
+        status = ("expired" if d["expires_at"] <= iso(now)
+                  else "revoked" if d.get("access_version") != doc["access_version"] else "active")
+        items.append({"link_id": d["link_id"], "recipient": d["recipient"], "permission": d["permission"],
+                      "created_at": r["ts"], "expires_at": d["expires_at"], "status": status,
+                      "opened": d["link_id"] in opened})
+    return {"items": items, "server_time": iso(now), "ttl_seconds": ctx.settings.link_ttl_seconds}
 
 
-@router.post("/api/documents/{doc_id}/share-links", status_code=201,
-             summary="Create a read-only, expiring external link (owner only). The token is shown once.")
-def create_link(doc_id: str, body: ShareLinkRequest, principal: Principal = Depends(current_principal),
-                conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
-    doc = authorize(conn, ctx.audit, principal.audit_ctx, principal.user, doc_id, Action.SHARE)
-    if body.expires_in_hours > ctx.settings.share_link_max_hours:
-        raise HTTPException(status_code=400, detail=f"Links can live at most {ctx.settings.share_link_max_hours} hours")
-    if body.max_uses > ctx.settings.share_link_max_uses:
-        raise HTTPException(status_code=400, detail=f"Links allow at most {ctx.settings.share_link_max_uses} downloads")
-    token = new_token()
-    link_id = new_id()
-    expires_at = iso(utcnow() + timedelta(hours=body.expires_in_hours))
-    label = clean_line(body.label, 100)
+@router.post("/api/documents/{doc_id}/links/revoke-all",
+             summary="Invalidate every outstanding share link for this document at once (owner only)")
+def revoke_all_links(doc_id: str, principal: Principal = Depends(current_principal),
+                     conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    doc = require_access(conn, ctx, principal, doc_id, Action.SHARE, audit_action="link.revoked_all").doc
     with transaction(conn) as tx:
-        tx.execute(
-            """INSERT INTO share_links (id, document_id, token_hash, created_by, created_at, expires_at, max_uses, label)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (link_id, doc["id"], hash_token(token), principal.id, now_iso(), expires_at, body.max_uses, label),
-        )
-        ctx.audit.append(tx, principal.audit_ctx, "share_link.create", "allowed", document_id=doc["id"],
-                         details={"link_id": link_id, "expires_at": expires_at, "max_uses": body.max_uses,
-                                  "label": label})
-    # The token lives in the URL *fragment*: browsers never send it to the
-    # server in the page request, so it stays out of access logs and Referer.
-    return {"id": link_id, "token": token, "path": f"/share#{token}", "expires_at": expires_at,
-            "max_uses": body.max_uses}
-
-
-@router.delete("/api/documents/{doc_id}/share-links/{link_id}", summary="Revoke a share link (owner only). Immediate.")
-def revoke_link(doc_id: str, link_id: str, principal: Principal = Depends(current_principal),
-                conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
-    doc = authorize(conn, ctx.audit, principal.audit_ctx, principal.user, doc_id, Action.SHARE)
-    link = conn.execute("SELECT * FROM share_links WHERE id = ?", (link_id,)).fetchone() if is_valid_id(link_id) else None
-    if link is None or link["document_id"] != doc["id"]:  # AUTHZ-CHECK[link-belongs-to-document]
-        with transaction(conn) as tx:
-            ctx.audit.append(tx, principal.audit_ctx, "share_link.revoke", "denied", document_id=doc["id"],
-                             details={"reason": "link_not_in_document", "link_id": link_id[:64]})
-        raise HTTPException(status_code=404, detail="Link not found")
-    with transaction(conn) as tx:
-        tx.execute("UPDATE share_links SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?", (now_iso(), link["id"]))
-        ctx.audit.append(tx, principal.audit_ctx, "share_link.revoke", "allowed", document_id=doc["id"],
-                         details={"link_id": link["id"]})
+        tx.execute("UPDATE documents SET access_version = access_version + 1 WHERE id = ?", (doc["id"],))
+        ctx.audit.append(tx, principal.audit_ctx, "link.revoked_all", "allowed", document_id=doc["id"],
+                         details={"from_version": doc["access_version"], "to_version": doc["access_version"] + 1})
     return {"ok": True}
+
+
+@router.post("/api/links/open", summary="Open a share link made for you (any signed-in user; the named recipient only)")
+def open_link(body: LinkOpenRequest, principal: Principal = Depends(current_principal),
+              conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    if not ctx.limiter.allow(f"link-open:{principal.id}", ctx.settings.link_rate_per_user_per_minute, 60):
+        with transaction(conn) as tx:
+            ctx.audit.append(tx, principal.audit_ctx, "link.opened", "denied", details={"reason": "rate_limited"})
+        raise HTTPException(status_code=429, detail="Too many attempts. Wait a minute and try again.")
+    try:
+        doc_id = verify_signature(ctx.keyring, body.token).document_id
+    except BadLink:
+        # Not even a valid signature: refuse without touching any document.
+        record_denial(conn, ctx, principal.audit_ctx, Decision(False, "link_invalid", Action.VIEW), "", "link.opened")
+        raise no_access()
+    d = require_access(conn, ctx, principal, doc_id, Action.VIEW, link_token=body.token, require_link=True,
+                       audit_action="link.opened")
+    with transaction(conn) as tx:
+        ctx.audit.append(tx, principal.audit_ctx, "link.opened", "allowed", document_id=d.doc["id"],
+                         details={"link_id": d.link.link_id, "permission": d.link.permission,
+                                  "effective_permission": d.permission, "via": d.via})
+    return {"document_id": d.doc["id"], "name": d.doc["name"], "link_permission": d.link.permission,
+            "permission": d.permission, "via": d.via,
+            "expires_at": iso(datetime.fromtimestamp(d.link.expires_at, tz=timezone.utc)), "server_time": now_iso()}
 
 
 # -------------------------------------------------------------- suggestions --
@@ -223,7 +333,7 @@ def revoke_link(doc_id: str, link_id: str, principal: Principal = Depends(curren
             summary="Suggest people who may need view access (owner only). Never grants anything.")
 def get_suggestions(doc_id: str, principal: Principal = Depends(current_principal),
                     conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
-    doc = authorize(conn, ctx.audit, principal.audit_ctx, principal.user, doc_id, Action.SHARE)
+    doc = require_access(conn, ctx, principal, doc_id, Action.SHARE, audit_action="ai.suggestion.generated").doc
     proposals = suggest_readers(conn, principal.id, doc)
     now = now_iso()
     with transaction(conn) as tx:
@@ -243,13 +353,14 @@ def get_suggestions(doc_id: str, principal: Principal = Depends(current_principa
                                                    "permission": p["permission"], "score": p["score"]}
                                                   for p in proposals]})
     return {"items": proposals,
-            "note": "Suggestions never change access. Confirm a person to give them view-only access (you can choose a higher level instead)."}
+            "note": "Suggestions never change access. Confirm a person to give them view-only access "
+                    f"for {ctx.settings.default_grant_minutes} minutes (you can choose a higher level or longer time instead)."}
 
 
 @router.post("/api/documents/{doc_id}/suggestions/{suggestion_id}/dismiss", summary="Dismiss a suggestion (owner only)")
 def dismiss_suggestion(doc_id: str, suggestion_id: str, principal: Principal = Depends(current_principal),
                        conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
-    doc = authorize(conn, ctx.audit, principal.audit_ctx, principal.user, doc_id, Action.SHARE)
+    doc = require_access(conn, ctx, principal, doc_id, Action.SHARE, audit_action="ai.suggestion.dismissed").doc
     sug = conn.execute("SELECT * FROM suggestions WHERE id = ?", (suggestion_id,)).fetchone() \
         if is_valid_id(suggestion_id) else None
     if sug is None or sug["document_id"] != doc["id"]:  # AUTHZ-CHECK[dismiss-suggestion-belongs-to-document]

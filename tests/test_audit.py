@@ -30,11 +30,11 @@ def test_every_required_event_is_recorded(world, db):
     actions = {(r["action"], r["outcome"], r["actor_name"]) for r in audit_rows(db, document_id=world.doc_a)}
     for expected in [
         ("document.upload", "allowed", "alice"),
-        ("permission.grant", "allowed", "alice"),
+        ("access.granted", "allowed", "alice"),
         ("document.download", "allowed", "carol"),
         ("document.update", "allowed", "dave"),
         ("document.version_upload", "allowed", "dave"),
-        ("permission.revoke", "allowed", "alice"),
+        ("access.revoked", "allowed", "alice"),
         ("document.download", "denied", "carol"),
         ("document.download", "denied", "bob"),
         ("document.delete", "allowed", "alice"),
@@ -44,6 +44,9 @@ def test_every_required_event_is_recorded(world, db):
     row = audit_rows(db, action="document.download", outcome="allowed")[0]
     assert row["actor_id"] == world.ids["carol"] and row["ts"] and row["ip"]
     assert json.loads(row["details"])["sha256"]  # exactly which bytes were handed out
+    # ... and every refusal carries its internal reason (never shown to the caller).
+    reasons = {json.loads(r["details"])["reason"] for r in audit_rows(db, document_id=world.doc_a, outcome="denied")}
+    assert {"grant_revoked", "no_grant"} <= reasons
 
 
 def test_chain_verifies_when_untouched(world):
@@ -128,15 +131,15 @@ def test_owner_sees_activity_on_own_document_only(world):
     items = world["alice"].get(f"/api/documents/{world.doc_a}/activity").json()["items"]
     assert any(i["action"] == "document.download" and i["actor_name"] == "carol" for i in items)
     assert world["carol"].get(f"/api/documents/{world.doc_a}/activity").status_code == 403
-    assert world["bob"].get(f"/api/documents/{world.doc_a}/activity").status_code == 404
+    assert world["bob"].get(f"/api/documents/{world.doc_a}/activity").status_code == 403
 
 
 def test_audit_search_filters(world):
     world["bob"].get(f"/api/documents/{world.doc_a}/download")
     r = world["admin"].get("/api/admin/audit", params={"outcome": "denied", "actor": "bob"}).json()
     assert r["total"] >= 1 and all(i["actor_name"] == "bob" and i["outcome"] == "denied" for i in r["items"])
-    r = world["admin"].get("/api/admin/audit", params={"action": "permission."}).json()
-    assert r["total"] >= 2 and all(i["action"].startswith("permission.") for i in r["items"])
+    r = world["admin"].get("/api/admin/audit", params={"action": "access."}).json()
+    assert r["total"] >= 2 and all(i["action"].startswith("access.") for i in r["items"])
     r = world["admin"].get("/api/admin/audit", params={"document_id": world.doc_a, "action": "document.upload"}).json()
     assert r["total"] == 1 and r["items"][0]["document_name"] == "Salary letter - Carol.pdf"
 

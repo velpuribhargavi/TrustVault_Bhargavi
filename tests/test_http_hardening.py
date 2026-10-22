@@ -5,7 +5,7 @@ from conftest import ROLES
 
 
 def test_security_headers_on_pages_and_api(world):
-    for url in ["/", "/share", "/api/health"]:
+    for url in ["/", "/api/health"]:
         r = world.anon().get(url)
         h = r.headers
         assert h["x-frame-options"] == "DENY", url
@@ -13,6 +13,8 @@ def test_security_headers_on_pages_and_api(world):
         assert h["referrer-policy"] == "no-referrer", url
         csp = h["content-security-policy"]
         assert "frame-ancestors 'none'" in csp and "script-src 'self'" in csp and "unsafe-inline" not in csp, url
+    # The anonymous share page is gone: links need a signed-in recipient now.
+    assert world.anon().get("/share").status_code == 404
 
 
 def test_api_responses_are_not_cached(world):

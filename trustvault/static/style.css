@@ -146,13 +146,6 @@ dl.meta dd { margin: 0; word-break: break-word; }
             box-shadow: 0 6px 24px rgba(0,0,0,.18); font-size: .9rem; }
 #toast .t.err { background: var(--danger); }
 
-/* ---- share page ---- */
-.share-page { display: grid; place-items: center; padding: 1.5rem; }
-.share-card { background: #fff; border: 1px solid var(--line); border-radius: 14px; padding: 2rem; width: min(460px, 100%);
-              display: flex; flex-direction: column; gap: .9rem; }
-.share-card .brand { color: var(--brand); }
-.share-card .brand-mark { background: var(--brand); }
-.fineprint { font-size: .78rem; color: var(--muted); margin: 0; }
 
 /* ---- access levels, viewer, deleted users ---- */
 .badge.view { background: #eef4ff; color: #3355aa; }
@@ -165,3 +158,24 @@ dl.meta dd { margin: 0; word-break: break-word; }
 .watermark-line { margin: .25rem 0; font-size: .78rem; color: #a3271f; font-weight: 600; letter-spacing: .02em; }
 .small-help { flex-basis: 100%; margin: .2rem 0 0; font-size: .8rem; }
 tr.deleted-row td { color: var(--muted); }
+
+/* ---- time limits: countdowns, expired grants ---- */
+.countdown { font-variant-numeric: tabular-nums; font-weight: 600; }
+.countdown.low { color: var(--warn); }
+.countdown.over { color: var(--danger); }
+tr.expired-row td { color: var(--muted); }
+.row-actions { display: flex; gap: .35rem; align-items: center; flex-wrap: wrap; }
+select.compact { padding: .2rem .35rem; font-size: .8rem; }
+
+/* ---- "You don't have access to this file." ---- */
+.denied { max-width: 640px; margin: 2rem auto; text-align: center; display: flex; flex-direction: column; gap: .4rem; align-items: center; }
+.denied-mark { width: 64px; height: 64px; border-radius: 50%; background: var(--danger-bg); border: 2px solid var(--danger);
+               position: relative; margin-bottom: .6rem; }
+.denied-mark::after { content: ""; position: absolute; left: 14px; right: 14px; top: 29px; height: 6px; border-radius: 3px;
+                      background: var(--danger); }
+
+/* ---- idle sign-out warning ---- */
+.modal-backdrop { position: fixed; inset: 0; background: rgba(10, 20, 19, .55); display: grid; place-items: center; z-index: 100; }
+.modal { background: var(--panel); border-radius: 12px; padding: 1.4rem 1.5rem; width: min(440px, calc(100% - 2rem));
+         box-shadow: 0 18px 48px rgba(0,0,0,.25); display: flex; flex-direction: column; gap: .6rem; }
+.modal .actions { display: flex; gap: .5rem; justify-content: flex-end; }

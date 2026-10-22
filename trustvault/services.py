@@ -64,9 +64,9 @@ def crypto_shred_document(tx: Tx, ctx: AppContext, document_id: str) -> int:
     versions = tx.execute("SELECT id, blob_id FROM document_versions WHERE document_id = ?", (document_id,)).fetchall()
     tx.execute("UPDATE document_versions SET wrapped_key = NULL WHERE document_id = ?", (document_id,))
     now = now_iso()
-    tx.execute("UPDATE documents SET purged_at = ? WHERE id = ?", (now, document_id))
+    tx.execute("UPDATE documents SET purged_at = ?, access_version = access_version + 1 WHERE id = ?",
+               (now, document_id))
     tx.execute("DELETE FROM grants WHERE document_id = ?", (document_id,))
-    tx.execute("UPDATE share_links SET revoked_at = COALESCE(revoked_at, ?) WHERE document_id = ?", (now, document_id))
     blob_ids = [v["blob_id"] for v in versions]
     tx.after_commit(lambda: [ctx.blobs.delete(b) for b in blob_ids])
     return len(versions)

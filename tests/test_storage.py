@@ -78,8 +78,8 @@ def test_purge_crypto_shreds(world, db):
     assert db.execute("SELECT wrapped_key FROM document_versions WHERE id = ?", (world.version_a1,)).fetchone()[0] is None
     assert not path.exists()
     assert db.execute("SELECT COUNT(*) FROM grants WHERE document_id = ?", (world.doc_a,)).fetchone()[0] == 0
-    assert world["alice"].get(f"/api/documents/{world.doc_a}").status_code == 404
-    assert world["alice"].post(f"/api/documents/{world.doc_a}/restore").status_code == 404
+    assert world["alice"].get(f"/api/documents/{world.doc_a}").status_code == 403
+    assert world["alice"].post(f"/api/documents/{world.doc_a}/restore").status_code == 403
 
 
 def test_retention_purges_old_trash(world, db):

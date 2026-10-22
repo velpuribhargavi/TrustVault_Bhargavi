@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from .audit import AuditLog
 from .config import Settings
 from .crypto import KeyRing
+from .preview import OfficeRenderer
 from .security import Passwords, RateLimiter
 from .storage import BlobStore
 
@@ -18,6 +19,8 @@ class AppContext:
     blobs: BlobStore
     passwords: Passwords
     limiter: RateLimiter
+    office: OfficeRenderer
+    last_expiry_sweep: float = 0.0  # see deps.maybe_log_expired_grants
 
     @classmethod
     def build(cls, settings: Settings, create_keys: bool = False) -> "AppContext":
@@ -29,4 +32,5 @@ class AppContext:
             blobs=BlobStore(settings.blob_dir, durable=settings.durable_writes),
             passwords=Passwords(settings),
             limiter=RateLimiter(),
+            office=OfficeRenderer.from_settings(settings),
         )

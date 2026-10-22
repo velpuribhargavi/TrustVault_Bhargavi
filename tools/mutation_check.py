@@ -96,6 +96,11 @@ def check(mutant: Mutant, timeout: int, extra: list[str]) -> dict:
         shutil.copytree(ROOT, project, ignore=IGNORE)
         target = project / mutant.file
         lines = target.read_text(encoding="utf-8").splitlines()
+        if mutant.lineno > len(lines) or lines[mutant.lineno - 1] != mutant.original:
+            # The file changed since the checks were listed: mutating "line N" now
+            # would remove the wrong line and report a meaningless result.
+            return {"mutant": mutant, "killed": False, "by": "SOURCE CHANGED DURING RUN - rerun",
+                    "seconds": time.time() - started}
         lines[mutant.lineno - 1] = mutant.mutated_line()
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
         code, output = run_suite(project, timeout, extra)

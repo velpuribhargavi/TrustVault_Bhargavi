@@ -8,6 +8,9 @@ Uses the three seeded demo logins (admin, owner, viewer). Every attempt is a
 real HTTP request, so the refusals also show up in the audit trail and on the
 admin "Worth noticing" panel. The script cleans up the grants and links it
 creates.
+
+Every refusal must be the same answer - 403 "You don't have access to this
+file." - whether the document is missing, not shared, expired or too low a level.
 """
 from __future__ import annotations
 
@@ -17,6 +20,7 @@ import sys
 import httpx
 
 PASSWORDS = {"admin": "Keeper!Vault2026", "owner": "Author!Vault2026", "viewer": "Reader!Vault2026"}
+NO_ACCESS = "You don't have access to this file."
 
 results: list[tuple[str, bool, str]] = []
 
@@ -43,6 +47,12 @@ class User:
     def code(self, method: str, url: str, **kw) -> int:
         return self.req(method, url, **kw).status_code
 
+    def refused(self, method: str, url: str, **kw) -> bool:
+        """True only for the one uniform refusal."""
+        r = self.req(method, url, **kw)
+        return r.status_code == 403 and r.headers.get("content-type", "").startswith("application/json") \
+            and r.json().get("detail") == NO_ACCESS
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -61,17 +71,20 @@ def main() -> int:
     contract = docs["Q3 services contract - Acme Corp"]  # viewer: view + download
     budget = docs["Budget 2026"]                         # viewer: edit
     private = docs["Board minutes - private"]            # viewer: nothing
+    audit_papers = docs["Audit papers FY2025-26"]        # viewer: nothing
     private_version = owner.req("GET", f"/api/documents/{private}").json()["versions"][0]["id"]
 
     print("\nDirect object access (IDOR)")
-    check("viewer cannot open the private board minutes by id", viewer.code("GET", f"/api/documents/{private}") == 404)
-    check("viewer cannot download them", viewer.code("GET", f"/api/documents/{private}/download") == 404)
-    check("viewer cannot render them in the viewer", viewer.code("GET", f"/api/documents/{private}/preview") == 404)
+    check("viewer cannot open the private board minutes by id", viewer.refused("GET", f"/api/documents/{private}"))
+    check("viewer cannot download them", viewer.refused("GET", f"/api/documents/{private}/download"))
+    check("viewer cannot render them in the viewer", viewer.refused("GET", f"/api/documents/{private}/preview"))
     check("viewer cannot pull the private file through a document they CAN see",
-          viewer.code("GET", f"/api/documents/{contract}/versions/{private_version}/download") == 404)
+          viewer.refused("GET", f"/api/documents/{contract}/versions/{private_version}/download"))
+    check("a made-up id gets exactly the same answer (nothing to learn by probing)",
+          viewer.refused("GET", "/api/documents/AAAAAAAAAAAAAAAAAAAAAA"))
     check("anonymous gets 401", anon.get(f"/api/documents/{private}/download").status_code == 401)
-    check("admin cannot read content", admin.code("GET", f"/api/documents/{private}/download") == 404)
-    check("admin cannot render content", admin.code("GET", f"/api/documents/{private}/preview") == 404)
+    check("admin cannot read content", admin.refused("GET", f"/api/documents/{private}/download"))
+    check("admin cannot render content", admin.refused("GET", f"/api/documents/{private}/preview"))
 
     print("\nView only means view only")
     check("viewer CAN read the view-only salary letter in the browser",
@@ -79,10 +92,10 @@ def main() -> int:
     page = viewer.req("GET", f"/api/documents/{salary}/preview/pages/1")
     check("what the viewer gets is a watermarked PNG, not the PDF",
           page.status_code == 200 and page.content.startswith(b"\x89PNG") and b"%PDF" not in page.content)
-    check("viewer CANNOT download the view-only file", viewer.code("GET", f"/api/documents/{salary}/download") == 403)
+    check("viewer CANNOT download the view-only file", viewer.refused("GET", f"/api/documents/{salary}/download"))
     v1 = viewer.req("GET", f"/api/documents/{salary}").json()["versions"][0]["id"]
     check("viewer CANNOT download it through the versions endpoint either",
-          viewer.code("GET", f"/api/documents/{salary}/versions/{v1}/download") == 403)
+          viewer.refused("GET", f"/api/documents/{salary}/versions/{v1}/download"))
 
     print("\nEach level allows exactly what it says")
     check("download level: can download", viewer.code("GET", f"/api/documents/{contract}/download") == 200)
@@ -112,18 +125,35 @@ def main() -> int:
     before = viewer.code("GET", f"/api/documents/{private}/download")
     owner.req("DELETE", f"/api/documents/{private}/grants/{g['id']}")
     after = viewer.code("GET", f"/api/documents/{private}/download")
-    check("granted -> 200, revoked -> 404 on the same session", (before, after) == (200, 404), f"{before}->{after}")
+    check("granted -> 200, revoked -> 403 on the same session", (before, after) == (200, 403), f"{before}->{after}")
     g = owner.req("POST", f"/api/documents/{contract}/grants", json={"username": "viewer", "permission": "view"}).json()
     after = viewer.code("GET", f"/api/documents/{contract}/download")
-    owner.req("POST", f"/api/documents/{contract}/grants", json={"username": "viewer", "permission": "download"})
+    # Put the demo data back as it was (the seed gives the viewer a week).
+    owner.req("POST", f"/api/documents/{contract}/grants",
+              json={"username": "viewer", "permission": "download", "duration_minutes": 7 * 24 * 60})
     check("lowering download -> view stops downloads at once", after == 403, str(after))
 
-    link = owner.req("POST", f"/api/documents/{private}/share-links", json={"expires_in_hours": 1, "max_uses": 3}).json()
-    used = anon.post("/api/public/share/download", json={"token": link["token"]}).status_code
-    owner.req("DELETE", f"/api/documents/{private}/share-links/{link['id']}")
-    dead = anon.post("/api/public/share/download", json={"token": link["token"]}).status_code
-    check("share link works, then dies when revoked", (used, dead) == (200, 404), f"{used}->{dead}")
-    check("guessed share token refused", anon.post("/api/public/share/download", json={"token": "A" * 43}).status_code == 404)
+    print("\nShare links (5 minutes, one named person)")
+    link = owner.req("POST", f"/api/documents/{private}/links", json={"username": "viewer"}).json()
+    token = link["token"]
+    check("a link is useless without signing in", anon.post("/api/links/open", json={"token": token}).status_code == 401)
+    check("a forwarded link is useless to someone else, even an admin",
+          admin.refused("POST", "/api/links/open", json={"token": token}))
+    used = viewer.code("POST", "/api/links/open", json={"token": token})
+    peek = viewer.code("GET", f"/api/documents/{private}/preview", headers={"X-Link-Token": token})
+    check("the named person can open it and read it", (used, peek) == (200, 200), f"{used}, {peek}")
+    check("a view link cannot download",
+          viewer.refused("GET", f"/api/documents/{private}/download", headers={"X-Link-Token": token}))
+    head, body, sig = token.split(".")
+    check("an edited link (bad signature) is refused",
+          viewer.refused("POST", "/api/links/open", json={"token": f"{head}.{body}.{sig[::-1]}"}))
+    check("a link for one document cannot open another",
+          viewer.refused("GET", f"/api/documents/{audit_papers}", headers={"X-Link-Token": token}))
+    check("a link in the URL is ignored (header only, never logged)",
+          viewer.refused("GET", f"/api/documents/{private}?link={token}"))
+    owner.req("POST", f"/api/documents/{private}/links/revoke-all")
+    check("'Revoke all links' kills it before its 5 minutes are up",
+          viewer.refused("POST", "/api/links/open", json={"token": token}))
 
     print("\nMalicious uploads")
     for fname, data in [("x.html", b"<script>alert(1)</script>"), ("x.svg", b"<svg onload=alert(1)>"),

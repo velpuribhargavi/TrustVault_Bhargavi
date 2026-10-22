@@ -1,23 +1,29 @@
 # Five-minute demo script
 
-Before recording: `reset.bat` (fresh data), `run.bat`, open http://127.0.0.1:8000 in two browser windows
-(one normal, one private) so two people can be signed in at once. Keep a terminal open in the project folder
-with the virtual environment activated.
+Before recording: `reset.bat` (fresh data), then start the server **with a short idle timeout so the sign-out
+warning can be shown on camera**:
+
+```bat
+set TRUSTVAULT_SESSION_IDLE_MINUTES=3
+run.bat
+```
+
+Open http://127.0.0.1:8000 in **two browser windows** (one normal, one private) so two people can be signed in at
+once. Keep a terminal open in the project folder with the virtual environment activated.
 
 | Time | Show | Say |
 |---|---|---|
 | 0:00 | Login page | "TrustVault: the wrong person can never read the file, and we can prove who did. Three logins: admin, owner, viewer." |
-| 0:20 | Sign in as **owner** (`Author!Vault2026`) → Documents | "The owner sees what she owns. Search by name, owner, category, date - the server scopes every search to the caller's access." |
-| 0:40 | Open *Board minutes - private* → Who has access → show the Access dropdown | "Access is per document, per named person, at one of three levels: view only, view plus download, or edit. No folders, so sharing one file never shares forty." |
-| 1:00 | Private window: sign in as **viewer** (`Reader!Vault2026`) → Documents | "The viewer sees only the four documents shared with them - the board minutes do not exist for them." |
-| 1:15 | Viewer: open *Salary letter - Vikram* → **View** → page 2 | "View only: no Download button. The server never sends the PDF - it renders each page as an image with the viewer's name and the time across it. Every page opened is recorded." |
-| 1:40 | Viewer: open *Q3 contract* → View, then Download | "This one is view plus download, so the original file comes down." |
-| 1:55 | Owner: on the contract, change viewer to **View only**. Viewer: click Download again → refused | "Changing access is immediate: no cached permissions. The very next request is refused - and the refusal is recorded." |
-| 2:15 | Terminal: `python scripts\attack_selftest.py` | "This attacks the running system the way a judge would - other documents' ids, versions of other documents, view-only trying to download, privilege escalation, CSRF, search wildcards, malicious uploads. 35 of 35 held." |
-| 2:50 | Owner: upload a `.html` file → rejected | "Uploads are checked by content, not by name: executables, HTML, SVG, PDF JavaScript, Office macros, zip bombs, CSV formulas are refused. Accepted files are encrypted with a key per version." |
-| 3:05 | Copy the address of the *Board minutes* page into the viewer's window and press refresh 5 times | "The viewer guesses a document address. Every attempt says *not found* - the same answer as a document that does not exist." |
-| 3:20 | Sign in as **admin** (`Keeper!Vault2026`) → Overview | "The admin sees what just happened: a high alert for repeated refused access by the viewer, plus integrity status. But the admin cannot open any document and can only remove access." |
-| 3:40 | Admin → Users | "Admin CRUD: create, change role, deactivate, delete. Delete is final but keeps the record, because the audit trail must still name who did what." |
+| 0:15 | Sign in as **owner** (`Author!Vault2026`) → Documents | "The owner sees what she owns. Search is scoped by the server to what you can access." |
+| 0:30 | Open *Board minutes - private* → *Who has access* → person Vikram, **View only**, **For how long: 15 minutes** → Grant | "Access is per document, per named person, at one of three levels - and it always ends. 30 minutes by default; here 15. There's the countdown, with Extend and Revoke." |
+| 0:55 | Private window: sign in as **viewer** (`Reader!Vault2026`) → *Salary letter* → **View** | "View only: the server never sends the PDF. It renders each page as an image with the viewer's name and the time across it. No download button - and the download URL is refused." |
+| 1:20 | Owner: *Q3 contract* → change Vikram to **View only**. Viewer: open the contract → **Download** | "Changing access applies on the very next click. And look at the answer: *You don't have access to this file.* It's the same answer for a document that doesn't exist, one you were never given, one that expired - you learn nothing by probing. The real reason is in the audit trail." |
+| 1:50 | Owner: *Audit papers* → **Share link** → Vikram → Create → Copy. Paste into the viewer window | "A share link works for five minutes, only for the person it names, signed in as themselves. Here it is, with its countdown." |
+| 2:15 | Paste the same link into the owner's window (or sign in as admin) | "Forwarded to anyone else, it opens nothing - and the admin is told." |
+| 2:30 | Owner: **Revoke all links**. Viewer: click View again → no access | "Revoking doesn't wait for the five minutes: the link carries a version number, and revoking changes it." |
+| 2:45 | Leave the viewer window alone until the *"Are you still there?"* dialog appears → **Stay signed in** | "Sessions end after 15 minutes without activity - three for this recording - or 8 hours. Two minutes before, it asks. If nobody answers, you're signed out, and after signing in you land back where you were." |
+| 3:05 | Terminal: `python scripts\attack_selftest.py` | "This attacks the running system the way a judge would: other documents' ids, versions of other documents, view-only trying to download, forged and forwarded links, CSRF, search wildcards, malicious uploads. 42 of 42 held." |
+| 3:30 | Sign in as **admin** (`Keeper!Vault2026`) → Overview, then *Access review* → a document | "The admin sees what happened: refused access, the forwarded link. Every grant with its end time. But the admin can never open a document, never give access - only take it away." |
 | 3:55 | Terminal: `python scripts\tamper_demo.py` | "What stops someone quietly editing the audit trail? Append-only triggers, an HMAC chain whose key is not in the database, and an external anchor. Edit a row, delete the newest rows - all detected." |
-| 4:25 | Terminal: `python tools\mutation_check.py --list`, then `docs\mutation_report.txt` | "You said you'd remove an authorisation check and rerun our tests. This tool does that for all 40 checks. Every single removal makes a test fail." |
-| 4:50 | THREATS.md on screen | "Every threat we thought of, what we did, the test that proves it - and what we chose not to build." |
+| 4:20 | Terminal: `python tools\mutation_check.py --list`, then `docs\mutation_report.txt` | "You said you'd remove an authorisation check and rerun our tests. This tool does that for all 42 checks. Every single removal makes a test fail." |
+| 4:45 | `trustvault\config.py` (the four time limits), then THREATS.md | "Every time limit in one place, every threat with the test that proves it - and what we chose not to build." |

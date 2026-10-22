@@ -2,8 +2,10 @@
 -- Applied by scripts/init_db.py and by the app on start-up. Idempotent.
 
 -- (foreign_keys is switched on per connection in db.connect)
--- Schema version 2: permission levels view / download / edit; users.deleted_at.
-PRAGMA user_version = 2;
+-- Schema version 3: every grant expires (grants.expires_at NOT NULL), documents
+-- carry an access_version that invalidates share links, anonymous share links
+-- are gone (links are now signed, 5-minute, for one named person - not stored).
+PRAGMA user_version = 3;
 
 -- ---------------------------------------------------------------------------
 -- Users and sessions
@@ -51,7 +53,11 @@ CREATE TABLE IF NOT EXISTS documents (
     updated_at         TEXT NOT NULL,
     deleted_at         TEXT,           -- set while the document is in the trash
     deleted_by         TEXT,
-    purged_at          TEXT            -- set once the content has been crypto-shredded
+    purged_at          TEXT,           -- set once the content has been crypto-shredded
+    -- Signed share links carry the access_version they were issued under. Any
+    -- reduction of access (revoke, lower a level, "revoke all links", trash)
+    -- increments it, so every outstanding link dies on its next use.
+    access_version     INTEGER NOT NULL DEFAULT 1 CHECK (access_version >= 1)
 );
 CREATE INDEX IF NOT EXISTS idx_documents_owner   ON documents(owner_id);
 CREATE INDEX IF NOT EXISTS idx_documents_created ON documents(created_at);
@@ -80,6 +86,9 @@ CREATE INDEX IF NOT EXISTS idx_versions_doc ON document_versions(document_id);
 --   view     = open it in the browser (watermarked render); never the file itself
 --   download = view + download the original file
 --   edit     = download + upload new versions + change name/category/description
+-- Every grant has an expiry (default 30 minutes, see config.py). An expired
+-- row stays so the owner can see it and extend it; the access check ignores it.
+-- expiry_logged_at records that the 'access.expired' audit event was written.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS grants (
     id          TEXT PRIMARY KEY,
@@ -88,27 +97,15 @@ CREATE TABLE IF NOT EXISTS grants (
     permission  TEXT NOT NULL CHECK (permission IN ('view', 'download', 'edit')),
     granted_by  TEXT NOT NULL REFERENCES users(id),
     created_at  TEXT NOT NULL,
-    expires_at  TEXT,
+    expires_at  TEXT NOT NULL,
+    expiry_logged_at TEXT,
     source      TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'suggestion')),
     UNIQUE (document_id, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_grants_user ON grants(user_id);
 CREATE INDEX IF NOT EXISTS idx_grants_doc  ON grants(document_id);
-
--- External share links: read-only, expiring, use-limited, revocable.
-CREATE TABLE IF NOT EXISTS share_links (
-    id          TEXT PRIMARY KEY,
-    document_id TEXT NOT NULL REFERENCES documents(id),
-    token_hash  TEXT NOT NULL UNIQUE,
-    created_by  TEXT NOT NULL REFERENCES users(id),
-    created_at  TEXT NOT NULL,
-    expires_at  TEXT NOT NULL,
-    max_uses    INTEGER NOT NULL CHECK (max_uses > 0),
-    use_count   INTEGER NOT NULL DEFAULT 0,
-    revoked_at  TEXT,
-    label       TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_links_doc ON share_links(document_id);
+-- Finds grants that ran out but whose expiry is not yet in the audit trail.
+CREATE INDEX IF NOT EXISTS idx_grants_unlogged_expiry ON grants(expires_at) WHERE expiry_logged_at IS NULL;
 
 -- Access suggestions. A suggestion never grants anything by itself; it is
 -- only a record of what was proposed and what the owner decided.

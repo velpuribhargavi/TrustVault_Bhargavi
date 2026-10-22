@@ -14,6 +14,19 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# ---------------------------------------------------------------------------
+# Time limits - the ONE place they are defined. Everything else (the access
+# check, the session check, the grant and link endpoints, the UI via
+# /api/meta and the tests) reads these values; nothing hard-codes a duration.
+# Each can be overridden with TRUSTVAULT_<NAME> (e.g. TRUSTVAULT_LINK_TTL_SECONDS).
+# ---------------------------------------------------------------------------
+LINK_TTL_SECONDS = 300          # a share link works for 5 minutes, for one named person
+DEFAULT_GRANT_MINUTES = 30      # access granted without a chosen duration lasts 30 minutes
+SESSION_IDLE_MINUTES = 15       # signed out after 15 minutes without a request
+SESSION_MAX_HOURS = 8           # signed out 8 hours after sign-in, whatever happens
+MAX_GRANT_DAYS = 366            # the longest duration an owner may pick for a grant
+SESSION_WARNING_SECONDS = 120   # the UI warns this long before an idle sign-out
+
 
 def _env(name: str, default: str) -> str:
     return os.environ.get(f"TRUSTVAULT_{name}", default)
@@ -31,9 +44,18 @@ class Settings:
     # Upload limits.
     max_upload_bytes: int = field(default_factory=lambda: int(float(_env("MAX_UPLOAD_MB", "10")) * 1024 * 1024))
 
-    # Sessions: idle timeout and absolute lifetime.
-    session_idle_minutes: int = field(default_factory=lambda: int(_env("SESSION_IDLE_MINUTES", "30")))
-    session_absolute_hours: int = field(default_factory=lambda: int(_env("SESSION_ABSOLUTE_HOURS", "8")))
+    # Sessions: idle timeout and absolute lifetime (see the constants above).
+    session_idle_minutes: int = field(
+        default_factory=lambda: int(_env("SESSION_IDLE_MINUTES", str(SESSION_IDLE_MINUTES))))
+    session_absolute_hours: int = field(default_factory=lambda: int(_env("SESSION_MAX_HOURS", str(SESSION_MAX_HOURS))))
+    session_warning_seconds: int = field(
+        default_factory=lambda: int(_env("SESSION_WARNING_SECONDS", str(SESSION_WARNING_SECONDS))))
+
+    # Access lifetimes (see the constants above).
+    link_ttl_seconds: int = field(default_factory=lambda: int(_env("LINK_TTL_SECONDS", str(LINK_TTL_SECONDS))))
+    default_grant_minutes: int = field(
+        default_factory=lambda: int(_env("DEFAULT_GRANT_MINUTES", str(DEFAULT_GRANT_MINUTES))))
+    max_grant_days: int = field(default_factory=lambda: int(_env("MAX_GRANT_DAYS", str(MAX_GRANT_DAYS))))
 
     # Cookies. Set TRUSTVAULT_COOKIE_SECURE=1 whenever the app is served over HTTPS.
     cookie_secure: bool = field(default_factory=lambda: _env_bool("COOKIE_SECURE", False))
@@ -42,11 +64,14 @@ class Settings:
     login_max_failures: int = field(default_factory=lambda: int(_env("LOGIN_MAX_FAILURES", "5")))
     lockout_minutes: int = field(default_factory=lambda: int(_env("LOCKOUT_MINUTES", "15")))
     login_rate_per_ip_per_minute: int = field(default_factory=lambda: int(_env("LOGIN_RATE_PER_MINUTE", "20")))
-    public_rate_per_ip_per_minute: int = field(default_factory=lambda: int(_env("PUBLIC_RATE_PER_MINUTE", "30")))
+    # Opening share links: refused attempts per user per minute before 429.
+    link_rate_per_user_per_minute: int = field(default_factory=lambda: int(_env("LINK_RATE_PER_MINUTE", "30")))
 
-    # External share links.
-    share_link_max_hours: int = field(default_factory=lambda: int(_env("SHARE_LINK_MAX_HOURS", "168")))
-    share_link_max_uses: int = field(default_factory=lambda: int(_env("SHARE_LINK_MAX_USES", "50")))
+    # View-only rendering of Word / PowerPoint / Excel files as page images.
+    # "auto" = use LibreOffice when it is installed, otherwise show extracted
+    # text; "off" = always text; anything else = path to soffice(.exe).
+    office_renderer: str = field(default_factory=lambda: _env("OFFICE_RENDERER", "auto"))
+    office_render_timeout_seconds: int = field(default_factory=lambda: int(_env("OFFICE_RENDER_TIMEOUT", "60")))
 
     # Trash retention before a deleted document is crypto-shredded automatically.
     trash_retention_days: int = field(default_factory=lambda: int(_env("TRASH_RETENTION_DAYS", "30")))
