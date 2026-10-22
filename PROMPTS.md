@@ -166,6 +166,81 @@ would make the level meaningless.
 
 ---
 
+## 2026-10-22 - 9. Sessions: the sign-in page silently revived an expired session  *(access control)*
+
+**Asked:** (Phase 1 spec) "Sign people out after `SESSION_IDLE_MINUTES` = 15 without activity, warn them first with a
+'Stay signed in' button, send them back to the page they were on, and audit `auth.session_expired`."
+
+**Produced:** server side, the idle check in `deps.current_principal` plus an `auth.session_expired` audit row; client
+side, a timer that shows the warning and, when it runs out, clears the user and shows the sign-in page.
+
+**What was wrong:** the two clocks disagreed. The server only rewrote `last_seen_at` when it was more than **60 s** old,
+and the browser counted from its own last request - so the browser's 15 minutes could end *before* the server's. The
+sign-in page then called `GET /api/auth/me` to see whether a session already existed... the server still considered it
+alive, and **that request slid the idle timer forward**: the person was silently signed back in by the very screen that
+was supposed to sign them out. An unattended screen would never actually lock. Found by walking through the client and
+server timelines side by side while writing `test_sessions.py`; no test failed, because the server-only tests were
+right.
+
+**What I did instead:** when the browser's timer ends first it calls `POST /api/auth/logout` with
+`{"reason": "idle"}`, which deletes the session and records `auth.session_expired` with `detected: browser`; the sliding
+write threshold dropped from 60 s to 15 s and the browser ends 20 s early, so it never runs behind the server.
+Countdowns never call the server, so they cannot keep a session alive. Pinned by
+`tests/test_sessions.py::test_the_browser_can_end_an_idle_session_and_it_is_recorded` and
+`test_idle_for_15_minutes_signs_you_out_and_is_recorded_once` (server clock moved 15 min 1 s), and checked in a real
+browser (Playwright) with a 1-minute idle timeout: warning → *Stay signed in* → idle → sign-in page → back to the same
+document. THREATS.md T68.
+**Fixed in:** Phase 1 commit, 2026-10-22 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
+## 2026-10-22 - 10. Authorisation: one uniform 403 made a removed check invisible to the tests  *(authorisation, audit trail)*
+
+**Asked:** (Phase 1 spec) "Every endpoint that returns file content goes through one shared access-check function. Every
+refusal says 'You don't have access to this file.' Every denial is audited with the internal reason."
+
+**Produced:** `authz.check_access()` with the reasons in a fixed order and `require_access()` raising the one 403;
+the existing matrix tests updated from "404 for strangers, 403 for low levels" to "403 for everyone".
+
+**What was wrong:** with every refusal now identical, the check `if perm is None: deny("no_grant")`
+(`AUTHZ-CHECK[no-permission-no-access]`) became *invisible* to status-code tests: delete it and the level check further
+down still refuses, with a 403 that looks exactly the same - only the recorded reason changes (to the meaningless
+`None_cannot_view`). The first draft also looked the level up with `PERMISSION_ACTIONS[perm]`, so the mutant crashed
+with a `KeyError` and was reported **killed** - by a 500, for the wrong reason, which is exactly the trap PROMPTS
+entry 6 describes. The audit trail would have been quietly wrong (every stranger recorded as a level problem) and no
+test would have said so.
+
+**What I did instead:** the level lookup is total (`.get(perm, frozenset())`), so the mutant now behaves like a real
+deletion; and every refused case in `tests/test_authz_matrix.py` asserts both the exact 403 body **and** the internal
+reason in the audit row (`no_grant`, `grant_expired`, `admin_never_reads_content`, `<level>_cannot_<action>`).
+`tests/test_authz_unit.py` pins all 17 reasons and their order. The mutation run now kills
+`no-permission-no-access` through a reason assertion (`docs/mutation_report.txt`). A structural test,
+`test_every_document_route_goes_through_the_one_access_check`, parses the route code so "one shared function" is proven,
+not just claimed.
+**Fixed in:** Phase 1 commit, 2026-10-22 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
+## 2026-10-22 - 11. The mutation tool itself could report a meaningless result  *(other: test tooling)*
+
+**Asked:** "Run `tools/mutation_check.py` over the 42 checks while I finish the documentation and two small fixes."
+
+**Produced:** the run started; meanwhile three refusals that were not yet audited (invalid grant duration, extending a
+deactivated person's grant, the link-open rate limit) were fixed in `routes/sharing.py`.
+
+**What was wrong:** the tool lists every tagged check with its **line number** at the start, then copies the project
+and replaces "line N" for each mutant. Editing `sharing.py` during the run shifted its lines by three, so every later
+`sharing.py` mutant would have replaced the wrong line - a blank line or an unrelated statement - and could be
+reported KILLED or SURVIVED for reasons that have nothing to do with the check. Nothing warned about it. Found by
+re-reading the tool before trusting its report.
+
+**What I did instead:** stopped the run; the tool now refuses to mutate a line whose text no longer matches what it
+listed and reports `SOURCE CHANGED DURING RUN - rerun` instead of a verdict; then a clean rerun on frozen code
+(`docs/mutation_report.txt`).
+**Fixed in:** Phase 1 commit, 2026-10-22 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
 ## Template for the next entries
 
 ```
