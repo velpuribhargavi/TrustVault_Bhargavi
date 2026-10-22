@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8.0
+httpx>=0.27     # used by scripts/attack_selftest.py
+httpx2>=2.0     # used by the FastAPI/Starlette test client on current versions

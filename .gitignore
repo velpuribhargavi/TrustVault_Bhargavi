@@ -1,0 +1,10 @@
+# Database, encrypted files, KEYS, audit anchors - NEVER upload
+instance/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+!.env.example
