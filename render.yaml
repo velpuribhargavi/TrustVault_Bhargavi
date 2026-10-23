@@ -1,0 +1,21 @@
+services:
+    - type: web
+    name: trustvault
+    env: python
+    plan: free
+    region: singapore
+    branch: main
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app"
+    healthCheckPath: /healthz
+    envVars:
+            - key: TV_MASTER_KEY
+        generateValue: true
+            - key: TV_AUDIT_KEY
+        generateValue: true
+            - key: TV_DEMO_MODE
+        value: 1
+            - key: TV_TRUSTED_PROXIES
+        value: 1
+            - key: PYTHON_VERSION
+        value: 3.11.0
