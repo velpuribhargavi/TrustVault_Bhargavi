@@ -13,8 +13,4 @@ class AppContext:
 
     @classmethod
     def build(cls, settings, create_keys=False):
-        # Minimal build for Render deployment
         return cls(settings=settings)
-
-# For backward compatibility
-app_context = AppContext()
