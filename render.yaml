@@ -1,12 +1,11 @@
 services:
     - type: web
     name: trustvault
-    env: python
+    runtime: docker
     plan: free
     region: singapore
     branch: main
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn trustvault.app:app
+    dockerfilePath: ./Dockerfile
     healthCheckPath: /healthz
     envVars:
             - key: TV_MASTER_KEY
