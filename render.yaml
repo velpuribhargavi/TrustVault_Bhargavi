@@ -6,7 +6,6 @@ services:
       region: singapore
       branch: main
       dockerfilePath: ./Dockerfile
-      healthCheckPath: /healthz
       envVars:
         - key: TV_MASTER_KEY
           generateValue: true
