@@ -1,18 +1,18 @@
 services:
     - type: web
-    name: trustvault
-    runtime: docker
-    plan: free
-    region: singapore
-    branch: main
-    dockerfilePath: ./Dockerfile
-    healthCheckPath: /healthz
-    envVars:
-            - key: TV_MASTER_KEY
-        generateValue: true
-            - key: TV_AUDIT_KEY
-        generateValue: true
-            - key: TV_DEMO_MODE
-        value: 1
-            - key: TV_TRUSTED_PROXIES
-        value: 1
+      name: trustvault
+      runtime: docker
+      plan: free
+      region: singapore
+      branch: main
+      dockerfilePath: ./Dockerfile
+      healthCheckPath: /healthz
+      envVars:
+        - key: TV_MASTER_KEY
+          generateValue: true
+        - key: TV_AUDIT_KEY
+          generateValue: true
+        - key: TV_DEMO_MODE
+          value: 1
+        - key: TV_TRUSTED_PROXIES
+          value: 1
