@@ -46,8 +46,8 @@ def test_deactivated_user_is_locked_out_of_every_session_and_link(world, db):
     second_session = world.fresh("carol")
     bearer = Client(world.app)
     token = bearer.login("carol", mode="bearer").json()["token"]
-    link_token = world["alice"].post(f"/api/documents/{world.doc_a}/links", json={"username": "frank"}).json()["token"]
-    assert world["frank"].post("/api/links/open", json={"token": link_token}).status_code == 200
+    link_token = world["alice"].post(f"/api/documents/{world.doc_a}/links", json={"username": "gina"}).json()["token"]
+    assert world["gina"].post("/api/links/open", json={"token": link_token}).status_code == 200
 
     r = world["admin"].patch(f"/api/admin/users/{world.ids['carol']}", json={"is_active": False})
     assert r.status_code == 200 and r.json()["sessions_revoked"] == 3
@@ -59,7 +59,7 @@ def test_deactivated_user_is_locked_out_of_every_session_and_link(world, db):
 
     # alice leaves the company: the link she made dies with her account.
     world["admin"].patch(f"/api/admin/users/{world.ids['alice']}", json={"is_active": False})
-    assert world["frank"].post("/api/links/open", json={"token": link_token}).status_code == 403
+    assert world["gina"].post("/api/links/open", json={"token": link_token}).status_code == 403
 
 
 def test_inactive_user_with_surviving_session_row_is_rejected(world, db):

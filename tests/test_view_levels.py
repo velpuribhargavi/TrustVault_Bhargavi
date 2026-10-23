@@ -45,7 +45,7 @@ def test_view_only_cannot_download_any_way(world, db):
         r = gina.get(url)
         assert r.status_code == 403 and PDF_A not in r.content
     denied = [r for r in audit_rows(db, outcome="denied") if r["actor_id"] == world.ids["gina"]]
-    assert len(denied) == 2 and all('"view_cannot_download"' in r["details"] for r in denied)
+    assert len(denied) == 2 and all('"view_only"' in r["details"] for r in denied)
 
 
 def test_view_only_ui_flag_and_metadata(world):

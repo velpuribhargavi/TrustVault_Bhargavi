@@ -15,8 +15,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator
 
+from . import migrations
+
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 
 class SchemaVersionError(RuntimeError):
@@ -33,20 +35,30 @@ def connect(db_path: Path, durable: bool = True) -> sqlite3.Connection:
     return conn
 
 
-def init_schema(db_path: Path, durable: bool = True) -> None:
+def init_schema(db_path: Path, durable: bool = True) -> migrations.MigrationReport | None:
+    """Create the schema, or upgrade a v3+ database in place (data and audit
+    chain kept). Returns what was upgraded, or None for a new database."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = connect(db_path, durable=durable)
     try:
         has_tables = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'users'").fetchone()[0]
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if has_tables and version != SCHEMA_VERSION:
+        if has_tables and version > SCHEMA_VERSION:
+            raise SchemaVersionError(
+                f"The database at {db_path} was created by a newer TrustVault (schema v{version}; "
+                f"this version understands up to v{SCHEMA_VERSION}). Update the code instead.")
+        if has_tables and version < migrations.FIRST_UPGRADABLE_VERSION:
             raise SchemaVersionError(
                 f"The database at {db_path} was created by an older TrustVault (schema v{version}, "
-                f"this version needs v{SCHEMA_VERSION}). Run reset.bat (or: python scripts/init_db.py --reset --seed) "
-                "to recreate it.")
+                f"this version needs v{SCHEMA_VERSION} and can upgrade from v{migrations.FIRST_UPGRADABLE_VERSION}). "
+                "Run reset.bat (or: python scripts/init_db.py --reset --seed) to recreate it.")
         conn.execute("PRAGMA journal_mode = WAL")
-        # One transaction for the whole schema: one disk sync instead of one per statement.
-        conn.executescript("BEGIN;\n" + SCHEMA_PATH.read_text(encoding="utf-8") + "\nCOMMIT;")
+        report = migrations.MigrationReport(from_version=version, to_version=SCHEMA_VERSION) if has_tables else None
+        upgrade = migrations.structural_sql(conn, report) if report else ""
+        # One transaction for the upgrade and the whole schema: either all of it
+        # applies or none of it does, and it costs one disk sync.
+        conn.executescript("BEGIN;\n" + upgrade + SCHEMA_PATH.read_text(encoding="utf-8") + "\nCOMMIT;")
+        return report
     finally:
         conn.close()
 

@@ -15,7 +15,7 @@ from .errors import session_expired
 from .expiry import SWEEP_INTERVAL_SECONDS, log_expired_grants
 from .links import HEADER as LINK_HEADER
 from .links import MAX_TOKEN_LENGTH
-from .security import hash_token, tokens_equal
+from .security import hash_token, session_ref, tokens_equal
 from .utils import iso, parse_iso, utcnow
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -99,7 +99,7 @@ def current_principal(request: Request, conn: sqlite3.Connection = Depends(get_d
         raise HTTPException(status_code=401, detail="Not authenticated")
     now = utcnow()
     audit_ctx = AuditContext(actor_id=row["id"], actor_name=row["username"], ip=client_ip(request),
-                             user_agent=request.headers.get("user-agent"))
+                             user_agent=request.headers.get("user-agent"), session_ref=session_ref(token_hash))
     reason = session_end_reason(ctx, row, now)
     if reason is not None:  # AUTHZ-CHECK[session-expiry]
         with transaction(conn) as tx:
@@ -154,8 +154,17 @@ def link_token(request: Request) -> str | None:
 
 
 def require_role(*roles: str):
-    def checker(principal: Principal = Depends(current_principal)) -> Principal:
+    """Only these global roles may call the endpoint. A refusal is written to
+    the audit trail as 'auth.forbidden' (reason role_required) with the
+    method and path, so a viewer probing administrator functions shows up."""
+    def checker(request: Request, principal: Principal = Depends(current_principal),
+                conn: sqlite3.Connection = Depends(get_db)) -> Principal:
         if principal.role not in roles:  # AUTHZ-CHECK[role-required]
+            ctx: AppContext = request.app.state.ctx
+            with transaction(conn) as tx:
+                ctx.audit.append(tx, principal.audit_ctx, "auth.forbidden", "denied",
+                                 details={"reason": "role_required", "role": principal.role, "required": list(roles),
+                                          "method": request.method, "path": request.url.path[:200]})
             raise HTTPException(status_code=403, detail="Your role does not allow this action")
         return principal
     return checker

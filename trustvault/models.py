@@ -23,6 +23,29 @@ class LogoutRequest(Strict):
     reason: Optional[Literal["idle", "max_lifetime"]] = None
 
 
+class TwoFactorLoginRequest(Strict):
+    """Second step of signing in: the challenge from /login and a code."""
+    challenge: str = Field(min_length=10, max_length=128)
+    code: str = Field(min_length=6, max_length=32)
+
+
+class PasswordConfirmRequest(Strict):
+    password: str = Field(min_length=1, max_length=256)
+
+
+class CodeRequest(Strict):
+    code: str = Field(min_length=6, max_length=32)
+
+
+class DisableTwoFactorRequest(Strict):
+    password: str = Field(min_length=1, max_length=256)
+    code: str = Field(min_length=6, max_length=32)
+
+
+class BulkRevokeRequest(Strict):
+    grant_ids: list[str] = Field(min_length=1, max_length=500)
+
+
 class ChangePasswordRequest(Strict):
     current_password: str = Field(min_length=1, max_length=256)
     new_password: str = Field(min_length=1, max_length=256)
@@ -44,10 +67,35 @@ class GrantRequest(Strict):
     ``duration_minutes`` or an absolute ``expires_at``; with neither, the
     grant lasts DEFAULT_GRANT_MINUTES (config.py)."""
     username: str = Field(min_length=1, max_length=64)
-    permission: Literal["view", "download", "edit"]
+    # Without a level: View only (least privilege; the rule for Confidential documents).
+    permission: Optional[Literal["view", "download", "edit"]] = None
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=_MAX_MINUTES)
     expires_at: Optional[datetime] = None
     suggestion_id: Optional[str] = Field(default=None, max_length=64)
+
+
+class ClassificationRequest(Strict):
+    classification: Literal["public", "internal", "confidential"]
+
+
+class AccessRequestCreate(Strict):
+    """Ask a document's owner for access. ``document_id`` comes from a link or
+    the 'no access' page; the answer is the same whether or not it exists."""
+    document_id: str = Field(min_length=1, max_length=64)
+    permission: Literal["view", "download", "edit"] = "view"
+    note: str = Field(default="", max_length=500)
+
+
+class ApproveRequest(Strict):
+    """The owner's decision: level and duration (defaults: the requested level,
+    or View only for a Confidential document; 30 minutes, or 1 hour if Confidential)."""
+    permission: Optional[Literal["view", "download", "edit"]] = None
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=_MAX_MINUTES)
+    expires_at: Optional[datetime] = None
+
+
+class DenyRequest(Strict):
+    reason: str = Field(default="", max_length=300)
 
 
 class ExtendGrantRequest(Strict):

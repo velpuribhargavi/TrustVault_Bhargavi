@@ -60,6 +60,7 @@ class Action(str, Enum):
     PURGE = "purge"
     SHARE = "share"
     AUDIT = "audit"
+    CLASSIFY = "classify"    # change the Public / Internal / Confidential label (owner only)
 
 
 PERMISSION_LEVELS = ("view", "download", "edit")  # lowest to highest
@@ -77,27 +78,26 @@ TRASH_ACTIONS = frozenset({Action.VIEW, Action.RESTORE, Action.PURGE})
 
 # The internal reasons for a refusal, in the order check_access() tests them.
 # The caller only ever sees "You don't have access to this file."; the reason
-# goes to the audit trail.
+# goes to the audit trail, where only administrators can read it.
 DENIAL_REASONS = (
-    "invalid_document_id",        # not even a well-formed id
-    "document_not_found",
-    "document_destroyed",         # crypto-shredded
-    "user_inactive",              # deactivated or deleted account
+    "not_found",                  # no such document, never existed, or destroyed
+    "user_inactive",              # deactivated or deleted account (defence in depth)
     "admin_never_reads_content",  # separation of duties
-    # -- a share link was presented and could not be used (checked in this order)
-    "link_invalid",               # malformed, or the signature does not match
-    "link_wrong_document",
-    "link_wrong_recipient",       # made for somebody else (forwarded)
+    "in_trash",                   # only the owner may look at / restore / destroy it
+    # -- the request came through a share link: whose link is it?
+    "link_invalid",               # malformed, or the signature does not match (tampered)
+    "link_wrong_document",        # a link for another document
+    "wrong_user",                 # made for somebody else (forwarded)
+    # -- the person's own access
+    "no_grant",                   # never shared with this person
+    "grant_revoked",              # the owner (or an admin) took the access away
+    "grant_expired",
+    "view_only",                  # a View-only person asking for more (e.g. a download);
+                                  # other levels: "<level>_cannot_<action>", e.g. download_cannot_edit
+    # -- the share link itself
     "link_expired",               # older than LINK_TTL_SECONDS
     "link_revoked",               # access_version changed since it was made
-    "link_owner_changed",         # its creator is no longer the active owner
-    # -- no usable link and no usable grant
-    "grant_expired",
-    "grant_revoked",              # the owner (or an admin) took the access away
-    "no_grant",                   # never shared with this person
-    # -- has access, but not to this
-    "document_in_trash",
-    "level_too_low",              # recorded as "<level>_cannot_<action>", e.g. view_cannot_download
+    "link_owner_changed",         # its maker is no longer the active owner
     "version_not_in_document",    # a version id that belongs to another document
 )
 
@@ -115,6 +115,10 @@ ACCESS_SCOPE_SQL = (
 )
 
 
+def level_reason(perm: str | None, action: Action) -> str:
+    return "view_only" if perm == "view" else f"{perm}_cannot_{action.value}"
+
+
 @dataclass
 class Decision:
     allowed: bool
@@ -125,17 +129,18 @@ class Decision:
     via: str | None = None           # owner / grant / link
     grant: dict | None = None
     link: LinkClaims | None = None
-    link_problem: str | None = None  # why a presented link was not used (even if a grant was)
     version: dict | None = None
 
     @property
     def access_expires_at(self) -> str | None:
-        """When the access used for this request ends (None for the owner)."""
-        if self.via == "grant" and self.grant:
-            return self.grant["expires_at"]
+        """When the access used for this request ends (None for the owner).
+        Through a link: whichever ends first, the link or the grant."""
+        ends = []
+        if self.grant:
+            ends.append(self.grant["expires_at"])
         if self.via == "link" and self.link:
-            return iso(datetime.fromtimestamp(self.link.expires_at, tz=timezone.utc))
-        return None
+            ends.append(iso(datetime.fromtimestamp(self.link.expires_at, tz=timezone.utc)))
+        return min(ends) if ends else None
 
 
 def _was_revoked(conn: sqlite3.Connection, doc_id: str, user_id: str) -> bool:
@@ -155,35 +160,21 @@ def _parse_link(keyring, token: str) -> LinkClaims | None:
         return None
 
 
-def _link_problem(conn: sqlite3.Connection, claims: LinkClaims | None, doc: dict, user: dict,
-                  now_ts: float) -> str | None:
-    """None when the link may be used by ``user`` on ``doc`` right now."""
-    if claims is None:
-        return "link_invalid"
-    if claims.document_id != doc["id"]:  # AUTHZ-CHECK[link-matches-document]
-        return "link_wrong_document"
-    if claims.recipient_id != user["id"]:  # AUTHZ-CHECK[link-bound-to-recipient]
-        return "link_wrong_recipient"
-    if claims.expires_at <= now_ts:  # AUTHZ-CHECK[link-not-expired]
-        return "link_expired"
-    if claims.access_version != doc["access_version"]:  # AUTHZ-CHECK[link-not-revoked]
-        return "link_revoked"
-    creator = conn.execute("SELECT id, is_active FROM users WHERE id = ?", (claims.creator_id,)).fetchone()
-    lost = creator is None or not creator["is_active"] or doc["owner_id"] != claims.creator_id
-    if lost:  # AUTHZ-CHECK[link-creator-still-owner]
-        return "link_owner_changed"
-    return None
-
-
 def check_access(conn: sqlite3.Connection, keyring, user: dict, doc_id: str, action: Action, *,
-                 version_id: str | None = None, link_token: str | None = None, require_link: bool = False,
+                 version_id: str | None = None, link_token: str | None = None,
                  now: datetime | None = None) -> Decision:
     """Decide - without side effects - whether ``user`` may do ``action`` on ``doc_id``.
 
-    ``link_token``   a share link presented with the request (X-Link-Token header).
-    ``require_link`` the request is *about* the link (opening it): a link that
-                     cannot be used is refused even if a grant would allow access.
-    ``version_id``   the request targets this version, which must belong to the document.
+    Order (see DENIAL_REASONS): the document exists and is not in the trash ->
+    [link: signed, for this document, for this person] -> the person owns it or
+    holds a grant -> the grant has not expired -> the level allows the action ->
+    [link: not expired, not revoked, maker still the owner, its level allows it]
+    -> the requested version belongs to the document.
+
+    ``link_token``  a share link sent with the request (X-Link-Token header). A
+                    request that comes through a link needs a valid link AND a
+                    live grant: a link never gives access on its own.
+    ``version_id``  the request targets this version, which must belong to the document.
     """
     now = now or utcnow()
     now_s = iso(now)
@@ -195,51 +186,59 @@ def check_access(conn: sqlite3.Connection, keyring, user: dict, doc_id: str, act
     if is_valid_id(doc_id):
         doc = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
     if doc is None:  # AUTHZ-CHECK[document-must-exist]
-        return deny("document_not_found" if is_valid_id(doc_id) else "invalid_document_id")
+        return deny("not_found")
     doc = dict(doc)
     if doc["purged_at"] is not None:  # AUTHZ-CHECK[destroyed-document-unreachable]
-        return deny("document_destroyed", doc=doc)
+        return deny("not_found", doc=doc)
     if not user["is_active"]:  # AUTHZ-CHECK[inactive-user-has-no-access]
         return deny("user_inactive", doc=doc)
     if user["role"] == "admin":  # AUTHZ-CHECK[admin-has-no-content-access]
         return deny("admin_never_reads_content", doc=doc)
+    is_owner = doc["owner_id"] == user["id"]
+    if doc["deleted_at"] is not None and (not is_owner or action not in TRASH_ACTIONS):  # AUTHZ-CHECK[trashed-document-locked]
+        return deny("in_trash", doc=doc)
 
-    # 1. The person's own access: ownership, or a grant that has not expired.
-    base_perm, base_reason, grant = None, None, None
-    if doc["owner_id"] == user["id"]:
-        base_perm = "owner"
+    # A request through a share link: first, whose link is it?
+    claims = None
+    if link_token is not None:
+        claims = _parse_link(keyring, link_token)
+        if claims is None:
+            return deny("link_invalid", doc=doc)
+        if claims.document_id != doc["id"]:  # AUTHZ-CHECK[link-matches-document]
+            return deny("link_wrong_document", doc=doc, link=claims)
+        if claims.recipient_id != user["id"]:  # AUTHZ-CHECK[link-bound-to-recipient]
+            return deny("wrong_user", doc=doc, link=claims)
+
+    # The person's own access: ownership, or a grant that has not expired.
+    grant = None
+    if is_owner:
+        perm, via = "owner", "owner"
     else:
         row = conn.execute(_GRANT_LOOKUP_SQL, {"doc_id": doc["id"], "user_id": user["id"]}).fetchone()
-        if row is None:
-            base_reason = "grant_revoked" if _was_revoked(conn, doc["id"], user["id"]) else "no_grant"
-        elif row["expires_at"] <= now_s:  # AUTHZ-CHECK[expired-grant-ignored]
-            base_reason, grant = "grant_expired", dict(row)
-        else:
-            base_perm, grant = row["permission"], dict(row)
-
-    # 2. A share link, if one was presented.
-    claims, link_problem, link_perm = None, None, None
-    if link_token:
-        claims = _parse_link(keyring, link_token)
-        link_problem = _link_problem(conn, claims, doc, user, now.timestamp())
-        if link_problem is None:
-            link_perm = claims.permission
-    if require_link and (not link_token or link_problem is not None):
-        return deny(link_problem or "link_invalid", doc=doc, link=claims, link_problem=link_problem, grant=grant)
-
-    # The better of the two wins: a link never lowers what a grant allows.
-    if _RANK[link_perm] > _RANK[base_perm]:
-        perm, via = link_perm, "link"
-    else:
-        perm, via = base_perm, ("owner" if base_perm == "owner" else "grant" if base_perm else None)
+        grant = dict(row) if row is not None else None
+        perm, via = (grant["permission"], "grant") if grant else (None, None)
     if perm is None:  # AUTHZ-CHECK[no-permission-no-access]
-        return deny(link_problem or base_reason, doc=doc, link=claims, link_problem=link_problem, grant=grant)
-
-    common = dict(doc=doc, permission=perm, via=via, grant=grant, link=claims, link_problem=link_problem)
-    if doc["deleted_at"] is not None and (perm != "owner" or action not in TRASH_ACTIONS):  # AUTHZ-CHECK[trashed-document-locked]
-        return deny("document_in_trash", **common)
+        return deny("grant_revoked" if _was_revoked(conn, doc["id"], user["id"]) else "no_grant", doc=doc, link=claims)
+    if grant is not None and grant["expires_at"] <= now_s:  # AUTHZ-CHECK[expired-grant-ignored]
+        return deny("grant_expired", doc=doc, grant=grant, link=claims)
+    common = dict(doc=doc, permission=perm, via=via, grant=grant, link=claims)
     if action not in PERMISSION_ACTIONS.get(perm, frozenset()):  # AUTHZ-CHECK[permission-allows-action]
-        return deny(f"{perm}_cannot_{action.value}", **common)
+        return deny(level_reason(perm, action), **common)
+
+    # The link itself: 5 minutes, not revoked, its maker still the owner, its level.
+    if claims is not None:
+        if claims.expires_at <= now.timestamp():  # AUTHZ-CHECK[link-not-expired]
+            return deny("link_expired", **common)
+        if claims.access_version != doc["access_version"]:  # AUTHZ-CHECK[link-not-revoked]
+            return deny("link_revoked", **common)
+        maker = conn.execute("SELECT id, is_active FROM users WHERE id = ?", (claims.creator_id,)).fetchone()
+        lost = maker is None or not maker["is_active"] or doc["owner_id"] != claims.creator_id
+        if lost:  # AUTHZ-CHECK[link-creator-still-owner]
+            return deny("link_owner_changed", **common)
+        if action not in PERMISSION_ACTIONS[claims.permission]:  # AUTHZ-CHECK[link-level-caps-action]
+            return deny(level_reason(claims.permission, action), **common)
+        common["via"] = "link"
+        common["permission"] = claims.permission if _RANK[claims.permission] < _RANK[perm] else perm
 
     version = None
     if version_id is not None:
@@ -260,8 +259,6 @@ def record_denial(conn: sqlite3.Connection, ctx: AppContext, audit_ctx, decision
         details["requested_version"] = version_id[:64]
     if decision.link is not None:
         details["link_id"] = decision.link.link_id
-    if decision.link_problem and decision.link_problem != decision.reason:
-        details["link_problem"] = decision.link_problem
     if decision.permission:
         details["permission"] = decision.permission
     doc_id = decision.doc["id"] if decision.doc else None
@@ -272,11 +269,11 @@ def record_denial(conn: sqlite3.Connection, ctx: AppContext, audit_ctx, decision
 
 
 def require_access(conn: sqlite3.Connection, ctx: AppContext, principal, doc_id: str, action: Action, *,
-                   version_id: str | None = None, link_token: str | None = None, require_link: bool = False,
+                   version_id: str | None = None, link_token: str | None = None,
                    audit_action: str | None = None) -> Decision:
     """check_access() + audit the refusal + the uniform 403. Returns the Decision when allowed."""
     decision = check_access(conn, ctx.keyring, principal.user, doc_id, action, version_id=version_id,
-                            link_token=link_token, require_link=require_link)
+                            link_token=link_token)
     if not decision.allowed:
         record_denial(conn, ctx, principal.audit_ctx, decision, doc_id, audit_action or f"document.{action.value}",
                       version_id=version_id)

@@ -64,7 +64,7 @@ def test_stay_signed_in_restarts_the_idle_timer_but_not_the_8_hours(world, db, c
 
 def test_session_limits_are_reported_to_the_ui(world):
     r = world["carol"].get("/api/auth/me").json()["session"]
-    assert r["idle_timeout_seconds"] == 900 and r["warning_seconds"] == 120
+    assert r["idle_timeout_seconds"] == 900 and r["warning_seconds"] == 60  # warn one minute before
     lasts = (parse_iso(r["expires_at"]) - utcnow()).total_seconds()
     assert 7.9 * 3600 < lasts <= 8 * 3600
     login = world.anon().login("gina").json()

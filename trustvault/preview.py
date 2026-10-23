@@ -156,7 +156,7 @@ def _apply_watermark(image: Image.Image, text: str) -> Image.Image:
     probe = ImageDraw.Draw(overlay)
     left, top, right, bottom = probe.textbbox((0, 0), text, font=font)
     tile = Image.new("RGBA", (right - left + size * 2, bottom - top + size), (0, 0, 0, 0))
-    ImageDraw.Draw(tile).text((size, size // 2 - top), text, font=font, fill=(190, 30, 30, 64))
+    ImageDraw.Draw(tile).text((size, size // 2 - top), text, font=font, fill=(255, 46, 136, 70))  # neon rose
     tile = tile.rotate(28, expand=True)
     step_x, step_y = tile.width + size * 2, tile.height + size * 2
     for y in range(-step_y // 2, height, step_y):
@@ -168,7 +168,7 @@ def _apply_watermark(image: Image.Image, text: str) -> Image.Image:
     footer_font = _font(max(12, size * 2 // 3))
     footer_h = max(22, size + 10)
     draw = ImageDraw.Draw(overlay)
-    draw.rectangle([0, height - footer_h, width, height], fill=(15, 61, 58, 215))
+    draw.rectangle([0, height - footer_h, width, height], fill=(10, 10, 10, 225))  # jet black
     draw.text((10, height - footer_h + (footer_h - size * 2 // 3) // 2 - 2), text, font=footer_font,
               fill=(255, 255, 255, 255))
     return Image.alpha_composite(base, overlay).convert("RGB")

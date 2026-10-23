@@ -25,7 +25,17 @@ DEFAULT_GRANT_MINUTES = 30      # access granted without a chosen duration lasts
 SESSION_IDLE_MINUTES = 15       # signed out after 15 minutes without a request
 SESSION_MAX_HOURS = 8           # signed out 8 hours after sign-in, whatever happens
 MAX_GRANT_DAYS = 366            # the longest duration an owner may pick for a grant
-SESSION_WARNING_SECONDS = 120   # the UI warns this long before an idle sign-out
+SESSION_WARNING_SECONDS = 60    # the UI warns one minute before an idle sign-out
+TWO_FACTOR_CHALLENGE_SECONDS = 300  # after the password, the 6-digit code must follow within 5 minutes
+UNUSED_GRANT_DAYS = 30          # access review flags grants nobody has used for 30 days
+CONFIDENTIAL_GRANT_MINUTES = 60 # access to a Confidential document defaults to 1 hour (and View only)
+ACCESS_REQUEST_DAYS = 14        # an unanswered request for access lapses after 14 days
+MAX_PENDING_REQUESTS = 20       # open requests one person may have at a time
+
+# Roles that must use two-step sign-in (TOTP). Override with
+# TRUSTVAULT_TOTP_REQUIRED_ROLES="admin,owner" (or "" to make it optional for everyone).
+TOTP_REQUIRED_ROLES = ("admin", "owner")
+TWO_FACTOR_MAX_ATTEMPTS = 3     # wrong codes per sign-in attempt before the password is asked again
 
 
 def _env(name: str, default: str) -> str:
@@ -60,6 +70,18 @@ class Settings:
     # Cookies. Set TRUSTVAULT_COOKIE_SECURE=1 whenever the app is served over HTTPS.
     cookie_secure: bool = field(default_factory=lambda: _env_bool("COOKIE_SECURE", False))
 
+    # Two-step sign-in and access review (see the constants above).
+    totp_required_roles: tuple = field(default_factory=lambda: tuple(
+        r.strip() for r in _env("TOTP_REQUIRED_ROLES", ",".join(TOTP_REQUIRED_ROLES)).split(",") if r.strip()))
+    two_factor_challenge_seconds: int = field(
+        default_factory=lambda: int(_env("TWO_FACTOR_CHALLENGE_SECONDS", str(TWO_FACTOR_CHALLENGE_SECONDS))))
+    unused_grant_days: int = field(default_factory=lambda: int(_env("UNUSED_GRANT_DAYS", str(UNUSED_GRANT_DAYS))))
+    confidential_grant_minutes: int = field(
+        default_factory=lambda: int(_env("CONFIDENTIAL_GRANT_MINUTES", str(CONFIDENTIAL_GRANT_MINUTES))))
+    access_request_days: int = field(default_factory=lambda: int(_env("ACCESS_REQUEST_DAYS", str(ACCESS_REQUEST_DAYS))))
+    max_pending_requests: int = field(
+        default_factory=lambda: int(_env("MAX_PENDING_REQUESTS", str(MAX_PENDING_REQUESTS))))
+
     # Brute-force protection.
     login_max_failures: int = field(default_factory=lambda: int(_env("LOGIN_MAX_FAILURES", "5")))
     lockout_minutes: int = field(default_factory=lambda: int(_env("LOCKOUT_MINUTES", "15")))
@@ -72,6 +94,10 @@ class Settings:
     # text; "off" = always text; anything else = path to soffice(.exe).
     office_renderer: str = field(default_factory=lambda: _env("OFFICE_RENDERER", "auto"))
     office_render_timeout_seconds: int = field(default_factory=lambda: int(_env("OFFICE_RENDER_TIMEOUT", "60")))
+
+    # Audit CSV export: the most events one export may contain. A larger
+    # selection is refused (and the refusal logged) rather than cut short.
+    audit_export_max_rows: int = field(default_factory=lambda: int(_env("AUDIT_EXPORT_MAX_ROWS", "100000")))
 
     # Trash retention before a deleted document is crypto-shredded automatically.
     trash_retention_days: int = field(default_factory=lambda: int(_env("TRASH_RETENTION_DAYS", "30")))

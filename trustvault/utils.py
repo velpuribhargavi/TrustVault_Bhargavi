@@ -67,3 +67,41 @@ def clean_text(value: str, max_len: int) -> str:
 def clean_line(value: str, max_len: int) -> str:
     """Like clean_text but also removes newlines (for names, log fields)."""
     return " ".join(clean_text(value, max_len * 2).split())[:max_len]
+
+
+def describe_device(user_agent: str | None) -> str:
+    """'Chrome on Windows' - enough for a person to recognise their own device
+    in the session list. Not used for any security decision."""
+    ua = user_agent or ""
+    low = ua.lower()
+    if not ua:
+        return "Unknown device"
+    if "edg/" in low:
+        browser = "Edge"
+    elif "opr/" in low or "opera" in low:
+        browser = "Opera"
+    elif "firefox/" in low:
+        browser = "Firefox"
+    elif "chrome/" in low or "crios/" in low:
+        browser = "Chrome"
+    elif "safari/" in low and "version/" in low:
+        browser = "Safari"
+    elif "python-httpx" in low or "curl/" in low or "testclient" in low or "python-requests" in low:
+        browser = "Script / API client"
+    else:
+        browser = "Browser"
+    if "windows" in low:
+        system = "Windows"
+    elif "android" in low:
+        system = "Android"
+    elif "iphone" in low or "ipad" in low:
+        system = "iOS"
+    elif "mac os" in low or "macintosh" in low:
+        system = "macOS"
+    elif "cros" in low:
+        system = "ChromeOS"
+    elif "linux" in low:
+        system = "Linux"
+    else:
+        return browser
+    return f"{browser} on {system}"

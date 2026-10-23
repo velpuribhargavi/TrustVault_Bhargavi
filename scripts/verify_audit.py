@@ -28,7 +28,8 @@ def main() -> int:
     conn = connect(settings.db_path)
     result = AuditLog(keyring, settings.anchor_path).verify(conn).as_dict()
     print(json.dumps(result, indent=2))
-    print("\nAUDIT TRAIL INTACT" if result["ok"] else "\nAUDIT TRAIL HAS BEEN TAMPERED WITH")
+    print(f"\n{result['message']}")
+    print("AUDIT TRAIL INTACT" if result["ok"] else "AUDIT TRAIL HAS BEEN TAMPERED WITH")
     return 0 if result["ok"] else 1
 
 

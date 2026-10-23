@@ -83,6 +83,16 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def session_ref(token_hash: str) -> str:
+    """A short tag that links audit events of one sign-in session.
+
+    Derived one-way from the stored token hash (itself one-way from the
+    token), with its own label so it is never equal to - or a prefix of -
+    anything that can authenticate. 16 hex characters: unique enough to
+    group events, useless as a credential."""
+    return hashlib.sha256(b"trustvault|audit-session|" + token_hash.encode("ascii")).hexdigest()[:16]
+
+
 def tokens_equal(a: str | None, b: str | None) -> bool:
     if not a or not b:
         return False

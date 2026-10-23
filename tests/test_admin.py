@@ -51,11 +51,11 @@ def test_admin_emergency_revoke_is_reduce_only(world, db):
 
 
 def test_admin_can_kill_every_share_link_of_a_document(world):
-    link = world["alice"].post(f"/api/documents/{world.doc_a}/links", json={"username": "frank"}).json()
-    frank = world["frank"]
-    assert frank.post("/api/links/open", json={"token": link["token"]}).status_code == 200
+    link = world["alice"].post(f"/api/documents/{world.doc_a}/links", json={"username": "gina"}).json()
+    gina = world["gina"]
+    assert gina.post("/api/links/open", json={"token": link["token"]}).status_code == 200
     assert world["admin"].post(f"/api/admin/documents/{world.doc_a}/links/revoke-all").status_code == 200
-    assert frank.post("/api/links/open", json={"token": link["token"]}).status_code == 403
+    assert gina.post("/api/links/open", json={"token": link["token"]}).status_code == 403
     assert world["alice"].post(f"/api/admin/documents/{world.doc_a}/links/revoke-all").status_code == 403
 
 
@@ -157,7 +157,7 @@ def test_alert_on_credential_stuffing_and_guessing(world, db):
 
 
 def test_alert_on_forwarded_and_tampered_links(world, db):
-    link = world["alice"].post(f"/api/documents/{world.doc_a}/links", json={"username": "frank"}).json()
+    link = world["alice"].post(f"/api/documents/{world.doc_a}/links", json={"username": "gina"}).json()
     assert world["bob"].post("/api/links/open", json={"token": link["token"]}).status_code == 403
     assert "forwarded_link" in rules(db, world)
     head, body, sig = link["token"].split(".")

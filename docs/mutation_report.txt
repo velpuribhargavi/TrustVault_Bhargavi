@@ -1,51 +1,84 @@
-Mutation check - 2026-10-22 (Phase 1) - python tools/mutation_check.py --jobs 2
+Mutation check - 2026-10-23 (Phase 4) - python tools/mutation_check.py --jobs 4
 Each line: one authorization check removed; KILLED = the test suite failed (good), with the first failing test.
 
+== Full run on the Phase 4 code (7 new checks: labels and requests for access)
+
 Baseline: running the unmodified test suite ...
-Baseline passed. Removing 42 checks one at a time (2 in parallel) ...
+Baseline passed. Removing 71 checks one at a time (4 in parallel) ...
 
-  KILLED   grant-matches-document                         35.9s  tests/test_authz_unit.py::test_grant_on_one_document_does_not_open_another
-  KILLED   grant-matches-user                              3.4s  tests/test_admin.py::test_admin_emergency_revoke_is_reduce_only
-  KILLED   search-grant-expiry                            50.2s  tests/test_search.py::test_expired_grant_disappears_from_search
-  KILLED   link-matches-document                          39.4s  tests/test_authz_unit.py::test_link_reasons_in_order
-  KILLED   link-bound-to-recipient                         4.9s  tests/test_admin.py::test_alert_on_forwarded_and_tampered_links
-  KILLED   link-not-expired                               38.0s  tests/test_authz_unit.py::test_link_reasons_in_order
-  KILLED   link-not-revoked                                3.4s  tests/test_admin.py::test_admin_can_kill_every_share_link_of_a_document
-  KILLED   link-creator-still-owner                       38.0s  tests/test_authz_unit.py::test_link_reasons_in_order
-  KILLED   document-must-exist                            36.8s  tests/test_authz_unit.py::test_document_reasons
-  KILLED   destroyed-document-unreachable                 37.6s  tests/test_authz_unit.py::test_document_reasons
-  KILLED   inactive-user-has-no-access                    35.9s  tests/test_authz_unit.py::test_inactive_user_gets_nothing_even_with_a_grant
-  KILLED   admin-has-no-content-access                    30.9s  tests/test_authz_matrix.py::test_document_access_matrix[admin-view]
-  KILLED   expired-grant-ignored                          29.9s  tests/test_authz_matrix.py::test_document_access_matrix[erin-view]
-  KILLED   no-permission-no-access                         7.3s  tests/test_audit.py::test_every_required_event_is_recorded
-  KILLED   trashed-document-locked                        39.8s  tests/test_authz_unit.py::test_document_reasons
-  KILLED   permission-allows-action                        9.2s  tests/test_audit.py::test_owner_sees_activity_on_own_document_only
-  KILLED   version-belongs-to-document                    41.5s  tests/test_authz_unit.py::test_version_must_belong_to_the_document
-  KILLED   admin-search-sees-nothing                      39.8s  tests/test_authz_unit.py::test_admin_gets_nothing_even_with_a_grant_row_or_a_link
-  KILLED   session-required                               12.0s  tests/test_auth.py::test_unauthenticated_requests_get_401
-  KILLED   session-must-exist                              4.0s  tests/test_admin.py::test_another_admin_can_remove_an_admin_and_its_session_dies
-  KILLED   session-expiry                                 51.0s  tests/test_revocation.py::test_idle_session_expires
-  KILLED   inactive-user-rejected                         50.0s  tests/test_revocation.py::test_inactive_user_with_surviving_session_row_is_rejected
-  KILLED   csrf-token-required                            11.7s  tests/test_auth.py::test_csrf_token_required_for_cookie_requests
-  KILLED   role-required                                   2.6s  tests/test_admin.py::test_non_admins_cannot_use_admin_api[alice]
-  KILLED   link-signature-valid                            5.3s  tests/test_admin.py::test_alert_on_forwarded_and_tampered_links
-  KILLED   deleted-account-is-final                        5.8s  tests/test_admin.py::test_admin_deletes_a_user_everything_ends_and_it_is_final
-  KILLED   admin-cannot-change-self                        3.3s  tests/test_admin.py::test_admin_cannot_lock_themselves_out
-  KILLED   admin-cannot-delete-self                        6.0s  tests/test_admin.py::test_admin_cannot_delete_themselves
-  KILLED   account-lockout                                 9.7s  tests/test_auth.py::test_account_locks_after_repeated_failures_even_for_right_password
-  KILLED   password-must-match                            10.0s  tests/test_auth.py::test_wrong_password_and_unknown_user_look_identical
-  KILLED   inactive-user-cannot-login                      6.4s  tests/test_admin.py::test_admin_deletes_a_user_everything_ends_and_it_is_final
-  KILLED   change-password-needs-current                  10.8s  tests/test_auth.py::test_change_password_requires_current_password
-  KILLED   password-guessing-locks-account                11.2s  tests/test_auth.py::test_change_password_cannot_be_used_to_brute_force
-  KILLED   search-scoped-to-access                        50.8s  tests/test_search.py::test_search_by_name_owner_category_and_date
-  KILLED   search-hides-trash                             50.9s  tests/test_search.py::test_trashed_document_disappears_from_grantee_search
-  KILLED   grant-target-must-be-active                     4.7s  tests/test_admin.py::test_grant_to_inactive_user_refused
-  KILLED   grant-target-not-admin                          3.0s  tests/test_admin.py::test_admin_cannot_grant_and_cannot_be_granted
-  KILLED   suggestion-matches-document                    40.5s  tests/test_idor.py::test_suggestion_of_another_document_cannot_be_used_to_grant
-  KILLED   grant-belongs-to-document                      40.2s  tests/test_idor.py::test_cannot_revoke_a_grant_of_another_document_through_own_document
-  KILLED   link-recipient-must-be-active                  43.6s  tests/test_links.py::test_only_the_owner_makes_links_and_never_for_admins_or_edit
-  KILLED   link-recipient-not-admin                        3.2s  tests/test_admin.py::test_admin_cannot_grant_and_cannot_be_granted
-  KILLED   dismiss-suggestion-belongs-to-document         40.1s  tests/test_idor.py::test_cannot_dismiss_suggestion_of_another_document
+  KILLED   grant-matches-document                          6.3s  tests/test_access_requests.py::test_a_viewer_asks_and_the_owner_approves_with_level_and_duration
+  KILLED   grant-matches-user                              5.8s  tests/test_access_requests.py::test_only_the_documents_owner_can_decide
+  KILLED   search-grant-expiry                           144.2s  tests/test_search.py::test_expired_grant_disappears_from_search
+  KILLED   document-must-exist                            15.9s  tests/test_account_sessions.py::test_security_headers_on_every_kind_of_response
+  KILLED   destroyed-document-unreachable                110.3s  tests/test_authz_unit.py::test_document_reasons
+  KILLED   inactive-user-has-no-access                   109.0s  tests/test_authz_unit.py::test_inactive_user_gets_nothing_even_with_a_grant
+  KILLED   admin-has-no-content-access                     5.0s  tests/test_access_requests.py::test_only_the_documents_owner_can_decide
+  KILLED   trashed-document-locked                       112.8s  tests/test_authz_unit.py::test_document_reasons
+  KILLED   link-matches-document                         110.9s  tests/test_authz_unit.py::test_link_reasons_in_order
+  KILLED   link-bound-to-recipient                        22.9s  tests/test_admin.py::test_alert_on_forwarded_and_tampered_links
+  KILLED   no-permission-no-access                         5.8s  tests/test_access_requests.py::test_only_the_documents_owner_can_decide
+  KILLED   expired-grant-ignored                          35.3s  tests/test_audit_page.py::test_quick_filter_expired_access
+  KILLED   permission-allows-action                        5.5s  tests/test_access_requests.py::test_a_viewer_asks_and_the_owner_approves_with_level_and_duration
+  KILLED   link-not-expired                              108.8s  tests/test_authz_unit.py::test_link_reasons_in_order
+  KILLED   link-not-revoked                               11.4s  tests/test_access_review.py::test_bulk_revoke_kills_outstanding_share_links_of_the_document
+  KILLED   link-creator-still-owner                      110.8s  tests/test_authz_unit.py::test_link_reasons_in_order
+  KILLED   link-level-caps-action                        109.1s  tests/test_authz_unit.py::test_a_link_caps_the_level_and_never_raises_it
+  KILLED   version-belongs-to-document                   112.2s  tests/test_authz_unit.py::test_version_must_belong_to_the_document
+  KILLED   admin-search-sees-nothing                     112.4s  tests/test_authz_unit.py::test_admin_gets_nothing_even_with_a_grant_row_or_a_link
+  KILLED   confidential-access-defaults-to-one-hour        9.8s  tests/test_access_requests.py::test_a_confidential_document_defaults_to_view_only_for_one_hour
+  KILLED   confidential-preview-is-marked                121.0s  tests/test_classification.py::test_confidential_previews_are_marked_confidential
+  KILLED   session-required                                6.1s  tests/test_access_requests.py::test_only_the_documents_owner_can_decide
+  KILLED   session-must-exist                             15.6s  tests/test_account_sessions.py::test_sign_out_another_session_ends_it_on_the_server_at_once
+  KILLED   session-expiry                                145.7s  tests/test_revocation.py::test_idle_session_expires
+  KILLED   inactive-user-rejected                        146.6s  tests/test_revocation.py::test_inactive_user_with_surviving_session_row_is_rejected
+  KILLED   csrf-token-required                            16.4s  tests/test_account_sessions.py::test_nobody_can_sign_out_someone_elses_session
+  KILLED   role-required                                   7.7s  tests/test_access_requests.py::test_administrators_never_ask
+  KILLED   link-signature-valid                           24.7s  tests/test_admin.py::test_alert_on_forwarded_and_tampered_links
+  KILLED   repeated-failures-lock-account                 16.0s  tests/test_account_sessions.py::test_lockout_and_rate_limit_each_write_an_audit_event
+  KILLED   requests-are-own-only                           6.9s  tests/test_access_requests.py::test_requests_are_private_to_the_person_who_asked
+  KILLED   incoming-requests-own-documents-only            6.8s  tests/test_access_requests.py::test_requests_are_private_to_the_person_who_asked
+  KILLED   ended-access-own-only                           9.9s  tests/test_access_requests.py::test_access_that_ran_out_can_be_asked_for_again
+  KILLED   request-must-be-pending                         6.1s  tests/test_access_requests.py::test_a_request_can_be_decided_only_once_and_only_while_pending
+  KILLED   deleted-account-is-final                       26.9s  tests/test_admin.py::test_admin_deletes_a_user_everything_ends_and_it_is_final
+  KILLED   admin-cannot-change-self                       20.6s  tests/test_admin.py::test_admin_cannot_lock_themselves_out
+  KILLED   admin-cannot-delete-self                       27.1s  tests/test_admin.py::test_admin_cannot_delete_themselves
+  KILLED   admin-cannot-reset-own-2fa                    172.3s  tests/test_two_factor.py::test_an_administrator_can_reset_someone_who_lost_their_phone
+  KILLED   csv-formula-neutralised                        44.0s  tests/test_audit_page.py::test_exported_cells_cannot_run_as_spreadsheet_formulas
+  KILLED   bulk-revoke-kills-links                        12.7s  tests/test_access_review.py::test_bulk_revoke_removes_the_grants_and_bumps_each_document_once
+  KILLED   sessions-are-own-only                          13.7s  tests/test_account_sessions.py::test_my_sessions_show_device_ip_and_last_seen_and_only_mine
+  KILLED   account-lockout                                16.9s  tests/test_account_sessions.py::test_lockout_and_rate_limit_each_write_an_audit_event
+  KILLED   password-must-match                            15.7s  tests/test_account_sessions.py::test_lockout_and_rate_limit_each_write_an_audit_event
+  KILLED   inactive-user-cannot-login                     24.9s  tests/test_admin.py::test_admin_deletes_a_user_everything_ends_and_it_is_final
+  KILLED   second-factor-must-match                      172.0s  tests/test_two_factor.py::test_a_wrong_code_is_refused_recorded_and_counts_towards_the_lockout
+  KILLED   enrolment-needs-a-working-code                172.0s  tests/test_two_factor.py::test_first_time_set_up_needs_a_working_code
+  KILLED   change-password-needs-current                  47.5s  tests/test_auth.py::test_change_password_requires_current_password
+  KILLED   password-guessing-locks-account                52.3s  tests/test_auth.py::test_change_password_cannot_be_used_to_brute_force
+  KILLED   2fa-setup-needs-password                      171.8s  tests/test_two_factor.py::test_setting_it_up_needs_the_password_and_a_working_code
+  KILLED   2fa-enable-needs-a-working-code               170.2s  tests/test_two_factor.py::test_setting_it_up_needs_the_password_and_a_working_code
+  KILLED   required-2fa-cannot-be-turned-off             172.0s  tests/test_two_factor.py::test_roles_that_require_it_cannot_turn_it_off
+  KILLED   2fa-disable-needs-password                    168.3s  tests/test_two_factor.py::test_turning_it_off_needs_the_password_and_a_code
+  KILLED   2fa-disable-needs-a-code                      170.9s  tests/test_two_factor.py::test_turning_it_off_needs_the_password_and_a_code
+  KILLED   new-backup-codes-need-a-code                  169.3s  tests/test_two_factor.py::test_new_backup_codes_replace_the_old_ones
+  KILLED   search-scoped-to-access                       123.9s  tests/test_classification.py::test_the_label_shows_in_every_document_list
+  KILLED   search-hides-trash                            147.3s  tests/test_search.py::test_trashed_document_disappears_from_grantee_search
+  KILLED   confidential-cancels-old-links                116.4s  tests/test_classification.py::test_raising_a_document_to_confidential_cancels_its_share_links
+  KILLED   grant-target-must-be-active                    10.1s  tests/test_access_requests.py::test_approval_follows_the_same_rules_as_giving_access_by_hand
+  KILLED   grant-target-not-admin                         18.3s  tests/test_admin.py::test_admin_cannot_grant_and_cannot_be_granted
+  KILLED   suggestion-matches-document                   121.1s  tests/test_idor.py::test_suggestion_of_another_document_cannot_be_used_to_grant
+  KILLED   grant-belongs-to-document                     119.5s  tests/test_idor.py::test_cannot_revoke_a_grant_of_another_document_through_own_document
+  KILLED   link-recipient-must-be-active                 129.5s  tests/test_links.py::test_only_the_owner_makes_links_and_never_for_admins_edit_or_inactive
+  KILLED   link-recipient-not-admin                      129.5s  tests/test_links.py::test_only_the_owner_makes_links_and_never_for_admins_edit_or_inactive
+  KILLED   link-recipient-needs-grant                    124.9s  tests/test_links.py::test_a_link_is_only_for_someone_who_already_has_access
+  KILLED   link-not-above-grant                          124.9s  tests/test_links.py::test_a_link_is_only_for_someone_who_already_has_access
+  KILLED   dismiss-suggestion-belongs-to-document        121.9s  tests/test_idor.py::test_cannot_dismiss_suggestion_of_another_document
+  KILLED   backup-code-single-use                        169.9s  tests/test_two_factor.py::test_a_backup_code_signs_in_once
+  KILLED   second-factor-enforced                        149.3s  tests/test_seed.py::test_a_fresh_seed_signs_in_with_the_published_demo_keys
+  KILLED   second-factor-required-for-role               165.3s  tests/test_two_factor.py::test_an_administrator_must_set_it_up_before_any_session_exists
+  KILLED   challenge-must-be-live                        165.9s  tests/test_two_factor.py::test_the_sign_in_attempt_ends_after_three_wrong_codes
+  KILLED   challenge-attempts-limited                    102.5s  tests/test_two_factor.py::test_the_sign_in_attempt_ends_after_three_wrong_codes
+  KILLED   totp-code-never-reused                         97.0s  tests/test_two_factor.py::test_a_code_never_works_twice
 
-42/42 mutants killed.
+71/71 mutants killed.
 Every authorization check is covered by at least one failing test when removed.
+
+Result: 71/71 mutants killed.

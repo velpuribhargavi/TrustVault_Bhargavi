@@ -99,6 +99,32 @@ class KeyRing:
         return hmac.new(self.link_key, message, hashlib.sha256).digest()
 
 
+    # --- small per-user secrets (two-step sign-in) ----------------------------
+    @property
+    def secrets_key(self) -> bytes:
+        """AES key for small secrets stored in the database (TOTP seeds),
+        derived from the master key with its own label."""
+        return hmac.new(self.master_key, b"trustvault|user-secrets|v1", hashlib.sha256).digest()
+
+    def seal(self, plaintext: bytes, aad: bytes) -> bytes:
+        """AES-256-GCM; ``aad`` binds the secret to its owner (a sealed seed
+        copied onto another user's row does not decrypt)."""
+        nonce = os.urandom(NONCE_LEN)
+        return nonce + AESGCM(self.secrets_key).encrypt(nonce, plaintext, aad)
+
+    def unseal(self, blob: bytes, aad: bytes) -> bytes:
+        try:
+            return AESGCM(self.secrets_key).decrypt(blob[:NONCE_LEN], blob[NONCE_LEN:], aad)
+        except (InvalidTag, ValueError, TypeError) as exc:
+            raise IntegrityError("sealed secret failed authentication") from exc
+
+    def backup_code_hash(self, user_id: str, code: str) -> str:
+        """Keyed hash of a backup code: a copy of the database alone cannot be
+        used to test guesses offline."""
+        key = hmac.new(self.master_key, b"trustvault|backup-codes|v1", hashlib.sha256).digest()
+        return hmac.new(key, f"{user_id}|{code}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def aad_for(document_id: str, version_id: str) -> bytes:
     return f"trustvault|{document_id}|{version_id}".encode("utf-8")
 

@@ -25,7 +25,7 @@ from trustvault.db import connect  # noqa: E402
 
 def show(title, audit, conn):
     r = audit.verify(conn).as_dict()
-    state = "INTACT" if r["ok"] else f"TAMPERING DETECTED at entry {r['first_bad_seq']}"
+    state = r["message"] if r["ok"] else f"TAMPERING DETECTED - {r['message']}"
     print(f"\n== {title}\n   -> {state}")
     for p in r["problems"] + r["warnings"]:
         print(f"      {p}")
@@ -52,7 +52,7 @@ def main() -> None:
         conn.execute("DROP TRIGGER audit_log_no_update")
         conn.execute("DROP TRIGGER audit_log_no_delete")
         conn.execute("UPDATE audit_log SET actor_name = 'someone-else' WHERE seq = 2")
-        show("3. Insider drops the triggers and rewrites entry 2", audit, conn)
+        show("3. Insider drops the triggers and rewrites event #2", audit, conn)
 
         conn.close()
         shutil.copy(settings.db_path, s.db_path)  # fresh copy for the next attack
@@ -64,7 +64,7 @@ def main() -> None:
         conn.execute("DROP TRIGGER audit_log_no_delete")
         last = conn.execute("SELECT MAX(seq) FROM audit_log").fetchone()[0]
         conn.execute("DELETE FROM audit_log WHERE seq > ?", (last - 2,))
-        show("4. Insider deletes the two newest entries (a clean truncation)", audit, conn)
+        show("4. Insider deletes the two newest events (a clean truncation)", audit, conn)
         conn.close()
     print("\nThe real database was not modified.")
 

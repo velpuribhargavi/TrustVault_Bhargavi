@@ -101,18 +101,21 @@ def test_revoked_grant_is_recorded_as_revoked_not_never_shared(world, db):
 
 
 def test_document_reasons(world, db):
-    assert _check(world, db, "alice", "../../etc/passwd").reason == "invalid_document_id"
-    assert _check(world, db, "alice", new_id()).reason == "document_not_found"
+    assert _check(world, db, "alice", "../../etc/passwd").reason == "not_found"
+    assert _check(world, db, "alice", new_id()).reason == "not_found"
     world["alice"].delete(f"/api/documents/{world.doc_a}")
-    assert _check(world, db, "dave", world.doc_a).reason == "document_in_trash"
+    assert _check(world, db, "dave", world.doc_a).reason == "in_trash"
+    assert _check(world, db, "bob", world.doc_a).reason == "in_trash"
     assert _check(world, db, "alice", world.doc_a).allowed  # the owner may still look at it in the trash
-    assert _check(world, db, "alice", world.doc_a, Action.DOWNLOAD).reason == "document_in_trash"
+    assert _check(world, db, "alice", world.doc_a, Action.DOWNLOAD).reason == "in_trash"
     world["alice"].delete(f"/api/documents/{world.doc_a}/purge")
-    assert _check(world, db, "alice", world.doc_a).reason == "document_destroyed"
+    assert _check(world, db, "alice", world.doc_a).reason == "not_found"
+    assert world["alice"].get(f"/api/documents/{world.doc_a}").status_code == 403  # destroyed = gone, even for its owner
 
 
-def test_level_too_low_names_the_level_and_the_action(world, db):
-    assert _check(world, db, "gina", world.doc_a, Action.DOWNLOAD).reason == "view_cannot_download"
+def test_level_reasons(world, db):
+    assert _check(world, db, "gina", world.doc_a, Action.DOWNLOAD).reason == "view_only"
+    assert _check(world, db, "gina", world.doc_a, Action.EDIT).reason == "view_only"
     assert _check(world, db, "carol", world.doc_a, Action.EDIT).reason == "download_cannot_edit"
     assert _check(world, db, "dave", world.doc_a, Action.SHARE).reason == "edit_cannot_share"
 
@@ -124,61 +127,61 @@ def test_version_must_belong_to_the_document(world, db):
 
 
 # ------------------------------------------------------------------ links
-def test_link_gives_its_recipient_temporary_access(world, db):
-    d = _check(world, db, "frank", world.doc_a, link_token=_link(world, db))
+def test_a_link_works_for_its_recipient_who_holds_a_grant(world, db):
+    d = _check(world, db, "gina", world.doc_a, link_token=_link(world, db, recipient="gina"))
     assert d.allowed and d.via == "link" and d.permission == "view"
-    assert d.access_expires_at is not None
+    # through a link, access ends when the link (5 min) or the grant ends, whichever is first
+    assert d.access_expires_at < d.grant["expires_at"]
+
+
+def test_a_link_never_gives_access_on_its_own(world, db):
+    d = _check(world, db, "frank", world.doc_a, link_token=_link(world, db, recipient="frank"))
+    assert not d.allowed and d.reason == "no_grant"
+    d = _check(world, db, "erin", world.doc_a, link_token=_link(world, db, recipient="erin"))
+    assert not d.allowed and d.reason == "grant_expired"
 
 
 def test_link_reasons_in_order(world, db):
-    good = _link(world, db)
+    good = _link(world, db, recipient="gina")
     head, body, sig = good.split(".")
     tampered = f"{head}.{body}.{'A' * len(sig)}"
-    assert _check(world, db, "frank", world.doc_a, link_token=tampered).reason == "link_invalid"
-    assert _check(world, db, "frank", world.doc_a, link_token="garbage").reason == "link_invalid"
-    assert _check(world, db, "frank", world.doc_b, link_token=good).reason == "link_wrong_document"
-    assert _check(world, db, "bob", world.doc_a, link_token=good).reason == "link_wrong_recipient"
-    old = _link(world, db, now=utcnow() - timedelta(seconds=301))
-    assert _check(world, db, "frank", world.doc_a, link_token=old).reason == "link_expired"
+    assert _check(world, db, "gina", world.doc_a, link_token=tampered).reason == "link_invalid"
+    assert _check(world, db, "gina", world.doc_a, link_token="garbage").reason == "link_invalid"
+    assert _check(world, db, "gina", world.doc_b, link_token=good).reason == "link_wrong_document"
+    assert _check(world, db, "carol", world.doc_a, link_token=good).reason == "wrong_user"  # even with her own grant
+    old = _link(world, db, recipient="gina", now=utcnow() - timedelta(seconds=301))
+    assert _check(world, db, "gina", world.doc_a, link_token=old).reason == "link_expired"
+    by_bob = _link(world, db, recipient="gina", creator="bob")  # bob does not own DOC_A
+    assert _check(world, db, "gina", world.doc_a, link_token=by_bob).reason == "link_owner_changed"
     with transaction(db) as tx:
         tx.execute("UPDATE documents SET access_version = access_version + 1 WHERE id = ?", (world.doc_a,))
-    assert _check(world, db, "frank", world.doc_a, link_token=good).reason == "link_revoked"
-    by_bob = _link(world, db, creator="bob")  # bob does not own DOC_A
-    assert _check(world, db, "frank", world.doc_a, link_token=by_bob).reason == "link_owner_changed"
+    assert _check(world, db, "gina", world.doc_a, link_token=good).reason == "link_revoked"
 
 
-def test_link_never_lowers_a_grant_and_a_bad_link_does_not_block_a_grant(world, db):
-    view_link = _link(world, db, recipient="dave", permission="view")
-    d = _check(world, db, "dave", world.doc_a, Action.EDIT, link_token=view_link)
-    assert d.allowed and d.permission == "edit" and d.via == "grant"
+def test_a_request_through_a_bad_link_is_refused_even_with_a_grant(world, db):
+    """If the request came through a link, the link must be valid (spec step 6)."""
     d = _check(world, db, "carol", world.doc_a, Action.DOWNLOAD, link_token="garbage")
-    assert d.allowed and d.link_problem == "link_invalid"
+    assert not d.allowed and d.reason == "link_invalid"
+    assert _check(world, db, "carol", world.doc_a, Action.DOWNLOAD).allowed  # without the link: her grant
 
 
-def test_link_can_raise_a_view_grant_to_download_for_five_minutes(world, db):
-    token = _link(world, db, recipient="gina", permission="download")
-    d = _check(world, db, "gina", world.doc_a, Action.DOWNLOAD, link_token=token)
-    assert d.allowed and d.via == "link"
-
-
-def test_require_link_refuses_a_bad_link_even_when_a_grant_exists(world, db):
-    d = _check(world, db, "carol", world.doc_a, link_token=_link(world, db, recipient="frank"), require_link=True)
-    assert not d.allowed and d.reason == "link_wrong_recipient"
-
-
-def test_link_level_is_capped_by_the_action(world, db):
-    d = _check(world, db, "frank", world.doc_a, Action.DOWNLOAD, link_token=_link(world, db))
-    assert not d.allowed and d.reason == "view_cannot_download"
-    d = _check(world, db, "frank", world.doc_a, Action.EDIT, link_token=_link(world, db, permission="download"))
-    assert not d.allowed and d.reason == "download_cannot_edit"
+def test_a_link_caps_the_level_and_never_raises_it(world, db):
+    view_link = _link(world, db, recipient="dave", permission="view")
+    d = _check(world, db, "dave", world.doc_a, Action.DOWNLOAD, link_token=view_link)
+    assert not d.allowed and d.reason == "view_only"
+    d = _check(world, db, "dave", world.doc_a, Action.VIEW, link_token=view_link)
+    assert d.allowed and d.permission == "view"
+    # a forged-looking "download" link for a View-only person still cannot download
+    d = _check(world, db, "gina", world.doc_a, Action.DOWNLOAD, link_token=_link(world, db, recipient="gina",
+                                                                                 permission="download"))
+    assert not d.allowed and d.reason == "view_only"
     with pytest.raises(ValueError):
         _link(world, db, permission="edit")
 
 
 def test_every_reason_is_documented():
     """The reasons check_access can produce are exactly the documented, ordered list."""
-    seen = {"invalid_document_id", "document_not_found", "document_destroyed", "user_inactive",
-            "admin_never_reads_content", "link_invalid", "link_wrong_document", "link_wrong_recipient",
-            "link_expired", "link_revoked", "link_owner_changed", "grant_expired", "grant_revoked", "no_grant",
-            "document_in_trash", "level_too_low", "version_not_in_document"}
+    seen = {"not_found", "user_inactive", "admin_never_reads_content", "in_trash", "link_invalid",
+            "link_wrong_document", "wrong_user", "no_grant", "grant_revoked", "grant_expired", "view_only",
+            "link_expired", "link_revoked", "link_owner_changed", "version_not_in_document"}
     assert set(DENIAL_REASONS) == seen

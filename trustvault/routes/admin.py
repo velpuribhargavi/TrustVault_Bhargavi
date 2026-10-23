@@ -5,21 +5,29 @@ but never document content, and can only ever reduce access.
 """
 from __future__ import annotations
 
+import csv
+import hashlib
+import io
 import json
 import sqlite3
+from dataclasses import asdict, dataclass
+from dataclasses import field as dc_field
 from datetime import date, timedelta
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import Path as PathParam
 
+from .. import twofactor
 from ..alerts import compute_alerts
+from ..audit_text import GROUPS, action_group, action_label, describe, reason_text
 from ..context import AppContext
 from ..db import transaction
 from ..deps import Principal, app_ctx, get_db, require_role
 from ..expiry import log_expired_grants
-from ..models import CreateUserRequest, ResetPasswordRequest, UpdateUserRequest
+from ..models import BulkRevokeRequest, CreateUserRequest, ResetPasswordRequest, UpdateUserRequest
 from ..security import password_problems
-from ..utils import clean_line, is_valid_id, iso, new_id, now_iso, utcnow
+from ..utils import clean_line, is_valid_id, iso, new_id, now_iso, parse_iso, utcnow
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 admin_only = require_role("admin")
@@ -27,9 +35,11 @@ admin_only = require_role("admin")
 
 def _user_row(r) -> dict:
     d = dict(r)
-    d.pop("password_hash", None)
+    for secret in ("password_hash", "totp_secret", "totp_pending", "totp_pending_at", "totp_last_step"):
+        d.pop(secret, None)  # never leaves the server, not even to an administrator
     d["is_active"] = bool(d["is_active"])
     d["is_external"] = bool(d["is_external"])
+    d["two_factor"] = bool(d.pop("totp_enabled_at", None))
     return d
 
 
@@ -157,6 +167,28 @@ def reset_password(user_id: str, body: ResetPasswordRequest, principal: Principa
     return {"ok": True, "sessions_revoked": revoked}
 
 
+@router.post("/users/{user_id}/reset-2fa",
+             summary="Turn off someone's two-step sign-in after they lost their phone (admin). Ends their sessions; "
+                     "if their role requires it, they set it up again at their next sign-in.")
+def reset_two_factor(user_id: str, principal: Principal = Depends(admin_only),
+                     conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    user = _load_user(conn, user_id)
+    # Your own is changed from the Account page, which asks for your password and
+    # a code - so a stolen administrator session cannot strip its own second factor.
+    if user["id"] == principal.id:  # AUTHZ-CHECK[admin-cannot-reset-own-2fa]
+        with transaction(conn) as tx:
+            ctx.audit.append(tx, principal.audit_ctx, "user.2fa_reset", "denied", target_user_id=user["id"],
+                             details={"reason": "own_account", "username": user["username"]})
+        raise HTTPException(status_code=400, detail="Use the Account page to change your own two-step sign-in")
+    with transaction(conn) as tx:
+        was_on = bool(user["totp_enabled_at"])
+        twofactor.deactivate(tx, user["id"])
+        ended = tx.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],)).rowcount
+        ctx.audit.append(tx, principal.audit_ctx, "user.2fa_reset", "allowed", target_user_id=user["id"],
+                         details={"username": user["username"], "was_enabled": was_on, "sessions_revoked": ended})
+    return {"ok": True, "sessions_revoked": ended}
+
+
 @router.post("/users/{user_id}/unlock", summary="Clear a sign-in lockout (admin)")
 def unlock_user(user_id: str, principal: Principal = Depends(admin_only),
                 conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
@@ -180,61 +212,223 @@ def revoke_sessions(user_id: str, principal: Principal = Depends(admin_only),
 
 
 # -------------------------------------------------------------------- audit --
-@router.get("/audit", summary="Search the audit trail (admin)")
-def audit_search(
-    action: Optional[str] = Query(None, max_length=64, description="Exact action or prefix ending in '.' e.g. 'access.'"),
+# Quick filters. Each is a fixed SQL fragment (no user input in the text);
+# values are bound parameters. They combine with each other and with the
+# form filters using AND.
+SHARING_ACTIONS = ("access.granted", "access.changed", "access.extended", "access.revoked", "access.bulk_revoked",
+                   "link.created", "link.revoked_all", "ai.suggestion.accepted")
+PRESETS: dict[str, tuple[str, str, str]] = {
+    "denied": ("Denied only", "Refused requests", "a.outcome = 'denied'"),
+    "last_24h": ("Last 24 hours", "Events from the last 24 hours", "a.ts >= :since_24h"),
+    "downloads": ("Downloads", "Downloads of current and older versions, allowed and refused",
+                  "a.action IN ('document.download', 'document.version_download')"),
+    "sharing": ("Sharing changes", "Access given, changed, extended or removed; share links made or stopped",
+                "a.action IN (" + ", ".join(f"'{x}'" for x in SHARING_ACTIONS) + ")"),
+    "expired": ("Expired access", "Access that ran out, and requests refused because access or a link had expired",
+                "(a.action = 'access.expired' OR (a.outcome = 'denied' AND "
+                "json_extract(a.details, '$.reason') IN ('grant_expired', 'link_expired')))"),
+}
+PresetName = Literal["denied", "last_24h", "downloads", "sharing", "expired"]
+
+_EVENT_SELECT = """SELECT a.*, d.name AS document_name, t.username AS target_username
+                   FROM audit_log a
+                   LEFT JOIN documents d ON d.id = a.document_id
+                   LEFT JOIN users t ON t.id = a.target_user_id"""
+
+
+@dataclass
+class AuditFilters:
+    action: Optional[str] = None
+    outcome: Optional[str] = None
+    actor: Optional[str] = None
+    document_id: Optional[str] = None
+    date_from: Optional[date] = None
+    date_to: Optional[date] = None
+    reason: Optional[str] = None
+    session: Optional[str] = None
+    preset: list[str] = dc_field(default_factory=list)
+
+    def sql(self) -> tuple[str, dict]:
+        clauses, params = ["1 = 1"], {}
+        if self.action:
+            if self.action.endswith("."):
+                clauses.append("a.action LIKE :action ESCAPE '\\'")
+                params["action"] = self.action.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            else:
+                clauses.append("a.action = :action")
+                params["action"] = self.action
+        if self.outcome:
+            clauses.append("a.outcome = :outcome")
+            params["outcome"] = self.outcome
+        if self.actor:
+            clauses.append("a.actor_name = :actor COLLATE NOCASE")
+            params["actor"] = self.actor
+        if self.document_id:
+            clauses.append("a.document_id = :document_id")
+            params["document_id"] = self.document_id
+        if self.date_from:
+            clauses.append("a.ts >= :df")
+            params["df"] = f"{self.date_from.isoformat()}T00:00:00.000000Z"
+        if self.date_to:
+            clauses.append("a.ts <= :dt")
+            params["dt"] = f"{self.date_to.isoformat()}T23:59:59.999999Z"
+        if self.reason:
+            clauses.append("a.outcome = 'denied' AND json_extract(a.details, '$.reason') = :reason")
+            params["reason"] = self.reason
+        if self.session:
+            clauses.append("a.session_ref = :session")
+            params["session"] = self.session
+        for key in dict.fromkeys(self.preset):  # each preset once, in the order given
+            clauses.append(PRESETS[key][2])
+            if key == "last_24h":
+                params["since_24h"] = iso(utcnow() - timedelta(hours=24))
+        return " AND ".join(clauses), params  # fixed fragments only; values are bound parameters
+
+    def as_dict(self) -> dict:
+        """The filters in force, for the export's audit event."""
+        out = {k: (v.isoformat() if isinstance(v, date) else v) for k, v in asdict(self).items() if v}
+        return out
+
+
+def audit_filters(
+    action: Optional[str] = Query(None, max_length=64, description="Exact action, or a prefix ending in '.' e.g. 'access.'"),
     outcome: Optional[Literal["allowed", "denied", "error", "info"]] = None,
     actor: Optional[str] = Query(None, max_length=64, description="Actor username"),
     document_id: Optional[str] = Query(None, max_length=64),
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
+    reason: Optional[str] = Query(None, max_length=64, pattern=r"^[a-z_]+$",
+                                  description="Internal denial reason, e.g. no_grant (denied events only)"),
+    session: Optional[str] = Query(None, pattern=r"^[0-9a-f]{16}$", description="Events of one sign-in session"),
+    preset: list[PresetName] = Query([], description="Quick filters: " + ", ".join(PRESETS)),
+) -> AuditFilters:
+    return AuditFilters(action, outcome, actor, document_id, date_from, date_to, reason, session, list(preset))
+
+
+def _event(row) -> dict:
+    e = dict(row)
+    try:
+        e["details"] = json.loads(e["details"] or "{}")
+    except ValueError:
+        e["details"] = {"unparsed": e["details"]}
+    e["action_label"] = action_label(e["action"])
+    e["summary"] = describe(e)
+    return e
+
+
+@router.get("/audit", summary="Search the audit trail (admin). Each event has a plain-language summary.")
+def audit_search(
+    filters: AuditFilters = Depends(audit_filters),
     page: int = Query(1, ge=1, le=100_000),
     page_size: int = Query(50, ge=1, le=500),
     principal: Principal = Depends(admin_only),
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    clauses, params = ["1 = 1"], {}
-    if action:
-        if action.endswith("."):
-            clauses.append("a.action LIKE :action ESCAPE '\\'")
-            params["action"] = action.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-        else:
-            clauses.append("a.action = :action")
-            params["action"] = action
-    if outcome:
-        clauses.append("a.outcome = :outcome")
-        params["outcome"] = outcome
-    if actor:
-        clauses.append("a.actor_name = :actor COLLATE NOCASE")
-        params["actor"] = actor
-    if document_id:
-        clauses.append("a.document_id = :document_id")
-        params["document_id"] = document_id
-    if date_from:
-        clauses.append("a.ts >= :df")
-        params["df"] = f"{date_from.isoformat()}T00:00:00.000000Z"
-    if date_to:
-        clauses.append("a.ts <= :dt")
-        params["dt"] = f"{date_to.isoformat()}T23:59:59.999999Z"
-    where = " AND ".join(clauses)  # fixed fragments only; values are bound parameters
+    where, params = filters.sql()
     total = conn.execute(f"SELECT COUNT(*) AS n FROM audit_log a WHERE {where}", params).fetchone()["n"]
     rows = conn.execute(
-        f"""SELECT a.*, d.name AS document_name FROM audit_log a LEFT JOIN documents d ON d.id = a.document_id
-            WHERE {where} ORDER BY a.seq DESC LIMIT :limit OFFSET :offset""",
+        f"{_EVENT_SELECT} WHERE {where} ORDER BY a.seq DESC LIMIT :limit OFFSET :offset",
         {**params, "limit": page_size, "offset": (page - 1) * page_size},
     ).fetchall()
-    items = [{**dict(r), "details": json.loads(r["details"])} for r in rows]
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    return {"items": [_event(r) for r in rows], "total": total, "page": page, "page_size": page_size,
+            "server_time": now_iso()}
 
 
-@router.get("/audit/verify", summary="Verify the audit hash chain and external anchors (admin)")
+@router.get("/audit/options", summary="Values for the audit filters: actions, denial reasons, quick filters (admin)")
+def audit_options(principal: Principal = Depends(admin_only), conn: sqlite3.Connection = Depends(get_db)):
+    actions = conn.execute("SELECT action, COUNT(*) AS n FROM audit_log GROUP BY action ORDER BY action").fetchall()
+    reasons = conn.execute(
+        """SELECT json_extract(details, '$.reason') AS reason, COUNT(*) AS n FROM audit_log
+           WHERE outcome = 'denied' GROUP BY reason ORDER BY n DESC, reason""").fetchall()
+    return {
+        "actions": [{"action": r["action"], "label": action_label(r["action"]), "group": action_group(r["action"]),
+                     "count": r["n"]} for r in actions],
+        "groups": GROUPS,
+        "reasons": [{"reason": r["reason"], "label": reason_text(r["reason"]) or r["reason"], "count": r["n"]}
+                    for r in reasons if r["reason"]],
+        "presets": [{"key": k, "label": v[0], "description": v[1]} for k, v in PRESETS.items()],
+    }
+
+
+@router.get("/audit/events/{seq}", summary="One audit event in full, its hash check and its session (admin)")
+def audit_event(seq: int = PathParam(..., ge=1, le=2 ** 62), principal: Principal = Depends(admin_only),
+                conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    row = conn.execute(f"{_EVENT_SELECT} WHERE a.seq = ?", (seq,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such audit event")
+    session = None
+    if row["session_ref"]:
+        total = conn.execute("SELECT COUNT(*) FROM audit_log WHERE session_ref = ?", (row["session_ref"],)).fetchone()[0]
+        events = conn.execute(f"{_EVENT_SELECT} WHERE a.session_ref = ? ORDER BY a.seq ASC LIMIT 200",
+                              (row["session_ref"],)).fetchall()
+        session = {"ref": row["session_ref"], "total": total, "events": [_event(r) for r in events],
+                   "truncated": total > len(events)}
+    return {"event": _event(row), "integrity": ctx.audit.check_entry(conn, dict(row)), "session": session}
+
+
+CSV_COLUMNS = ("seq", "time_utc", "actor", "actor_id", "action", "action_label", "outcome", "summary",
+               "document_id", "document_name", "target_user", "ip", "user_agent", "session_ref", "details_json",
+               "prev_hash", "entry_hash")
+# A cell starting with one of these is run as a formula by Excel / LibreOffice
+# / Google Sheets. Usernames from failed sign-ins and user agents are typed by
+# whoever is attacking, so every cell is neutralised (OWASP "CSV injection").
+FORMULA_START = ("=", "+", "-", "@", "\t", "\r", "\n")
+
+
+def csv_cell(value) -> str:
+    text = "" if value is None else str(value)
+    if text.startswith(FORMULA_START):  # AUTHZ-CHECK[csv-formula-neutralised]
+        return "'" + text
+    return text
+
+
+@router.get("/audit/export", summary="Export the filtered audit trail as CSV (admin). The response carries the "
+                                     "file's SHA-256, which is also written to the audit trail.")
+def audit_export(filters: AuditFilters = Depends(audit_filters), principal: Principal = Depends(admin_only),
+                 conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    where, params = filters.sql()
+    total = conn.execute(f"SELECT COUNT(*) AS n FROM audit_log a WHERE {where}", params).fetchone()["n"]
+    limit = ctx.settings.audit_export_max_rows
+    if total > limit:
+        with transaction(conn) as tx:
+            ctx.audit.append(tx, principal.audit_ctx, "audit.export", "denied",
+                             details={"reason": "too_many_rows", "rows": total, "limit": limit,
+                                      "filters": filters.as_dict()})
+        raise HTTPException(status_code=400, detail=f"{total} events match; one export can hold at most {limit}. "
+                                                    "Narrow the filters (for example a date range) and export in parts.")
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+    writer.writerow(CSV_COLUMNS)
+    for row in conn.execute(f"{_EVENT_SELECT} WHERE {where} ORDER BY a.seq ASC", params):
+        e = _event(row)
+        writer.writerow([csv_cell(v) for v in (
+            e["seq"], e["ts"], e["actor_name"], e["actor_id"], e["action"], e["action_label"], e["outcome"],
+            e["summary"], e["document_id"], e["document_name"], e["target_username"], e["ip"], e["user_agent"],
+            e["session_ref"], row["details"], e["prev_hash"], e["entry_hash"])])
+    body = b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")  # BOM: Excel then reads UTF-8 correctly
+    digest = hashlib.sha256(body).hexdigest()
+    filename = f"trustvault-audit-{utcnow():%Y%m%d-%H%M%S}.csv"
+    with transaction(conn) as tx:
+        ctx.audit.append(tx, principal.audit_ctx, "audit.export", "allowed",
+                         details={"rows": total, "bytes": len(body), "sha256": digest, "filename": filename,
+                                  "format": "csv", "filters": filters.as_dict()})
+    return Response(body, media_type="text/csv; charset=utf-8", headers={
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Content-SHA256": digest,
+        "X-Export-Rows": str(total),
+        "Cache-Control": "no-store",
+    })
+
+
+@router.get("/audit/verify", summary="Verify the audit hash chain and external anchors (admin). "
+                                     "Reports 'Chain intact (N events)' or the first broken or missing event.")
 def audit_verify(principal: Principal = Depends(admin_only), conn: sqlite3.Connection = Depends(get_db),
                  ctx: AppContext = Depends(app_ctx)):
     result = ctx.audit.verify(conn).as_dict()
     with transaction(conn) as tx:
         ctx.audit.append(tx, principal.audit_ctx, "audit.verify", "info",
                          details={"ok": result["ok"], "entries_checked": result["entries_checked"],
-                                  "first_bad_seq": result["first_bad_seq"]})
+                                  "first_bad_seq": result["first_bad_seq"], "message": result["message"]})
     return result
 
 
@@ -270,7 +464,7 @@ def stats(principal: Principal = Depends(admin_only), conn: sqlite3.Connection =
 @router.get("/documents", summary="All documents - metadata only, never content (admin)")
 def admin_documents(principal: Principal = Depends(admin_only), conn: sqlite3.Connection = Depends(get_db)):
     rows = conn.execute(
-        """SELECT d.id, d.name, d.category, d.created_at, d.updated_at, d.deleted_at, d.purged_at,
+        """SELECT d.id, d.name, d.category, d.classification, d.created_at, d.updated_at, d.deleted_at, d.purged_at,
                   u.username AS owner_username, u.is_active AS owner_active,
                   (SELECT COUNT(*) FROM grants g WHERE g.document_id = d.id AND g.expires_at > :now) AS grants,
                   (SELECT COUNT(*) FROM grants g WHERE g.document_id = d.id AND g.expires_at <= :now) AS expired_grants,
@@ -322,6 +516,91 @@ def admin_revoke_grant(grant_id: str, principal: Principal = Depends(admin_only)
                          details={"grant_id": grant["id"], "permission": grant["permission"],
                                   "expires_at": grant["expires_at"], "by_admin": True})
     return {"ok": True}
+
+
+# ------------------------------------------------- unused access (bulk) --
+# What counts as *using* a grant: anything that touched the document's content
+# or details through it. Read from the audit trail itself, so "unused" is backed
+# by the same tamper-evident evidence as everything else.
+USE_ACTIONS = ("document.view", "document.preview", "document.preview_page", "document.download",
+               "document.version_download", "document.update", "document.version_upload", "link.opened")
+
+
+def _last_use(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
+    marks = ", ".join("?" for _ in USE_ACTIONS)
+    rows = conn.execute(
+        f"""SELECT document_id, actor_id, MAX(ts) AS last FROM audit_log
+            WHERE outcome = 'allowed' AND action IN ({marks}) AND document_id IS NOT NULL AND actor_id IS NOT NULL
+            GROUP BY document_id, actor_id""", USE_ACTIONS).fetchall()
+    return {(r["document_id"], r["actor_id"]): r["last"] for r in rows}
+
+
+def _idle(grant, last_use: dict, now) -> tuple[str | None, str, int]:
+    """(last used, idle since, whole days idle). Idle since = the later of the
+    grant's creation and its last use."""
+    used = last_use.get((grant["document_id"], grant["user_id"]))
+    since = max(grant["created_at"], used or "")
+    return used, since, int((now - parse_iso(since)).total_seconds() // 86400)
+
+
+@router.get("/access-review", summary="Live grants with when each was last used; flags those unused for "
+                                      "UNUSED_GRANT_DAYS (30) (admin, metadata only)")
+def access_review(unused_days: Optional[int] = Query(None, ge=1, le=366), principal: Principal = Depends(admin_only),
+                  conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    days = unused_days or ctx.settings.unused_grant_days
+    now = utcnow()
+    rows = conn.execute(
+        """SELECT g.id, g.document_id, g.user_id, g.permission, g.created_at, g.expires_at, g.source,
+                  d.name AS document_name, d.deleted_at, o.username AS owner_username,
+                  u.username, u.display_name, u.is_external, u.is_active
+           FROM grants g JOIN documents d ON d.id = g.document_id JOIN users u ON u.id = g.user_id
+           JOIN users o ON o.id = d.owner_id
+           WHERE g.expires_at > ? AND d.purged_at IS NULL""", (iso(now),)).fetchall()
+    last_use = _last_use(conn)
+    items = []
+    for g in rows:
+        used, since, idle_days = _idle(g, last_use, now)
+        items.append({"grant_id": g["id"], "document_id": g["document_id"], "document_name": g["document_name"],
+                      "owner": g["owner_username"], "username": g["username"], "display_name": g["display_name"],
+                      "is_external": bool(g["is_external"]), "is_active": bool(g["is_active"]),
+                      "permission": g["permission"], "granted_at": g["created_at"], "expires_at": g["expires_at"],
+                      "last_used_at": used, "days_unused": idle_days, "in_trash": bool(g["deleted_at"]),
+                      "flagged": idle_days >= days})
+    items.sort(key=lambda i: (not i["flagged"], -i["days_unused"], i["document_name"].lower(), i["username"].lower()))
+    return {"unused_days": days, "server_time": iso(now), "flagged": sum(i["flagged"] for i in items), "items": items}
+
+
+@router.post("/access-review/revoke", summary="Bulk revoke (admin; only reduces access). Every affected document's "
+                                              "access_version goes up once, so its outstanding share links stop too.")
+def bulk_revoke(body: BulkRevokeRequest, principal: Principal = Depends(admin_only),
+                conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    wanted = [g for g in dict.fromkeys(body.grant_ids) if is_valid_id(g)]
+    marks = ", ".join("?" for _ in wanted) or "NULL"
+    grants = conn.execute(f"SELECT * FROM grants WHERE id IN ({marks})", wanted).fetchall()  # placeholders only
+    if not grants:
+        with transaction(conn) as tx:
+            ctx.audit.append(tx, principal.audit_ctx, "access.bulk_revoked", "denied",
+                             details={"reason": "not_found", "requested": len(body.grant_ids)})
+        raise HTTPException(status_code=404, detail="None of those grants exist any more")
+    now = utcnow()
+    last_use = _last_use(conn)
+    documents: list[str] = []
+    with transaction(conn) as tx:
+        for g in grants:
+            used, _, idle_days = _idle(g, last_use, now)
+            tx.execute("DELETE FROM grants WHERE id = ?", (g["id"],))
+            ctx.audit.append(tx, principal.audit_ctx, "access.revoked", "allowed", document_id=g["document_id"],
+                             target_user_id=g["user_id"],
+                             details={"grant_id": g["id"], "permission": g["permission"], "expires_at": g["expires_at"],
+                                      "by_admin": True, "bulk": True, "last_used_at": used, "unused_days": idle_days})
+            if g["document_id"] not in documents:
+                documents.append(g["document_id"])
+        for doc_id in documents:
+            tx.execute("UPDATE documents SET access_version = access_version + 1 WHERE id = ?", (doc_id,))  # AUTHZ-CHECK[bulk-revoke-kills-links]
+        ctx.audit.append(tx, principal.audit_ctx, "access.bulk_revoked", "allowed",
+                         details={"grants": len(grants), "documents": documents, "not_found": len(wanted) - len(grants),
+                                  "unused_days": ctx.settings.unused_grant_days})
+    return {"revoked": len(grants), "documents": len(documents), "not_found": len(body.grant_ids) - len(grants)}
 
 
 @router.post("/documents/{doc_id}/links/revoke-all",

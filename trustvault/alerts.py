@@ -22,6 +22,7 @@ LOGIN_USER_THRESHOLD = 5     # failed logins for one username
 LOGIN_IP_THRESHOLD = 10      # failed logins from one IP
 BULK_THRESHOLD = 10          # distinct documents downloaded by one user
 LINK_FORGERY_THRESHOLD = 3   # links with a bad signature presented by one user
+WRONG_CODE_THRESHOLD = 3     # wrong two-step codes after a correct password, one account
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
@@ -74,6 +75,7 @@ def compute_alerts(conn: sqlite3.Connection, hours: int = 24, verify_result: dic
     forged_links_by_actor = defaultdict(list)
 
     resets: dict[str, dict] = {}  # target user id -> the admin password-reset event
+    wrong_codes_by_user = defaultdict(list)  # password was right, the two-step code was not
 
     for e in events:
         action, outcome, d = e["action"], e["outcome"], e["details"]
@@ -85,6 +87,14 @@ def compute_alerts(conn: sqlite3.Connection, hours: int = 24, verify_result: dic
             add("admin_password_reset", "medium", "Administrator reset a user's password",
                 f"{e['actor_name']} reset the password of '{d.get('username')}' - confirm the user asked for it",
                 e["actor_name"], e["ts"], e["ts"], 1)
+        if action == "user.2fa_reset" and outcome == "allowed":
+            resets[e["target_user_id"]] = e
+            add("admin_2fa_reset", "medium", "Administrator reset someone's two-step sign-in",
+                f"{e['actor_name']} turned off the two-step sign-in of '{d.get('username')}' - confirm they lost "
+                "their phone and asked for it", e["actor_name"], e["ts"], e["ts"], 1)
+        if action == "auth.2fa_failed" and d.get("reason") in ("bad_code", "code_reused", "bad_backup_code",
+                                                               "secret_unreadable") and e["actor_id"]:
+            wrong_codes_by_user[e["actor_name"] or e["actor_id"]].append(e)
         if action == "auth.login" and outcome == "allowed" and e["actor_id"] in resets:
             reset = resets[e["actor_id"]]
             if e["ip"] and e["ip"] == reset["ip"]:
@@ -112,8 +122,7 @@ def compute_alerts(conn: sqlite3.Connection, hours: int = 24, verify_result: dic
                 e["actor_name"], e["ts"], e["ts"], 1)
         # A share link only works for the person it was made for. Someone else
         # presenting it means it was forwarded (or stolen).
-        if outcome == "denied" and (d.get("reason") == "link_wrong_recipient"
-                                    or d.get("link_problem") == "link_wrong_recipient"):
+        if outcome == "denied" and d.get("reason") == "wrong_user":
             add("forwarded_link", "medium", "Share link used by someone it was not made for",
                 f"'{e['actor_name']}' tried to open link {d.get('link_id')} made for another person "
                 f"(document {e['document_id']}) - it may have been forwarded", e["actor_name"], e["ts"], e["ts"], 1)
@@ -152,6 +161,13 @@ def compute_alerts(conn: sqlite3.Connection, hours: int = 24, verify_result: dic
         if hit:
             add("bulk_download", "high", "Bulk download",
                 f"'{actor}' downloaded or opened {hit[2]} different documents within 10 minutes - possible exfiltration",
+                actor, hit[0], hit[1], hit[2])
+    for actor, evs in wrong_codes_by_user.items():
+        hit = _burst(evs, WINDOW_LOGIN, WRONG_CODE_THRESHOLD)
+        if hit:
+            add("password_known_second_factor_failing", "high", "Right password, wrong two-step codes",
+                f"Someone signed in to '{actor}' with the right password but entered {hit[2]} wrong codes within "
+                "15 minutes - the password is probably known to someone else. Ask them to change it.",
                 actor, hit[0], hit[1], hit[2])
     for actor, evs in forged_links_by_actor.items():
         if len(evs) >= LINK_FORGERY_THRESHOLD:

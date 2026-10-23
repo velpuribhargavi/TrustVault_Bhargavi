@@ -20,7 +20,8 @@ from ..context import AppContext
 from ..crypto import IntegrityError
 from ..db import transaction
 from ..deps import Principal, app_ctx, current_principal, get_db, link_token, require_role
-from ..models import DocumentUpdate
+from .. import classification as labels
+from ..models import ClassificationRequest, DocumentUpdate
 from ..preview import OFFICE_TYPES, NoSuchPage, PreviewError, extract_text, kind_for, page_count, render_page
 from ..services import content_disposition, crypto_shred_document, get_version, read_version, store_version
 from ..utils import new_id, now_iso, utcnow
@@ -28,6 +29,10 @@ from ..validation import (ValidationError, validate_category, validate_descripti
                           validate_upload)
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
+
+# Audit detail fields only administrators may see (why a request was refused,
+# what was probed). Removed from the owner's per-document activity view.
+INTERNAL_DETAIL_KEYS = ("reason", "requested_id", "requested_version", "link_id", "error")
 
 SORTS = {
     "updated_desc": "d.updated_at DESC",
@@ -56,6 +61,7 @@ def _reject_upload(conn, ctx: AppContext, principal: Principal, action: str, doc
 def _doc_summary(row: dict) -> dict:
     return {
         "id": row["id"], "name": row["name"], "category": row["category"], "description": row["description"],
+        "classification": row.get("classification") or labels.DEFAULT,
         "owner": {"id": row["owner_id"], "username": row.get("owner_username"),
                   "display_name": row.get("owner_display_name")},
         "created_at": row["created_at"], "updated_at": row["updated_at"],
@@ -83,6 +89,7 @@ def upload_document(
     category: str = Form(...),
     name: str = Form(""),
     description: str = Form(""),
+    classification: str = Form("internal"),
     principal: Principal = Depends(require_role("owner")),
     conn: sqlite3.Connection = Depends(get_db),
     ctx: AppContext = Depends(app_ctx),
@@ -93,25 +100,26 @@ def upload_document(
         category = validate_category(category)
         display_name = validate_doc_name(name) if name.strip() else safe_name
         description = validate_description(description)
-    except ValidationError as exc:
+        label = labels.validate(classification)
+    except (ValidationError, labels.BadLabel) as exc:
         _reject_upload(conn, ctx, principal, "document.upload", None, file.filename, exc)
 
     doc_id = new_id()
     now = now_iso()
     with transaction(conn) as tx:
         tx.execute(
-            """INSERT INTO documents (id, owner_id, name, category, description, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (doc_id, principal.id, display_name, category, description, now, now),
+            """INSERT INTO documents (id, owner_id, name, category, description, classification, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (doc_id, principal.id, display_name, category, description, label, now, now),
         )
         version = store_version(tx, ctx, document_id=doc_id, filename=safe_name, file_type=file_type,
                                 data=data, uploaded_by=principal.id)
         ctx.audit.append(tx, principal.audit_ctx, "document.upload", "allowed", document_id=doc_id,
                          details={"name": display_name, "filename": safe_name, "category": category,
-                                  "size": version["size_bytes"], "sha256": version["sha256"],
+                                  "classification": label, "size": version["size_bytes"], "sha256": version["sha256"],
                                   "version_id": version["id"]})
-    return {"id": doc_id, "name": display_name, "category": category, "version": version["version_no"],
-            "sha256": version["sha256"]}
+    return {"id": doc_id, "name": display_name, "category": category, "classification": label,
+            "version": version["version_no"], "sha256": version["sha256"]}
 
 
 # ------------------------------------------------------------------ search --
@@ -213,6 +221,7 @@ def get_document(doc_id: str, principal: Principal = Depends(current_principal),
                          details=_access_details(d))
     return {
         "id": doc["id"], "name": doc["name"], "category": doc["category"], "description": doc["description"],
+        "classification": doc["classification"],
         "owner": {"id": doc["owner_id"], "username": owner["username"], "display_name": owner["display_name"]},
         "created_at": doc["created_at"], "updated_at": doc["updated_at"], "deleted_at": doc["deleted_at"],
         "current_version_id": doc["current_version_id"], "my_permission": d.permission,
@@ -277,8 +286,11 @@ def download_version(doc_id: str, version_id: str, principal: Principal = Depend
     return _send_version(conn, ctx, principal, d, d.version, "document.version_download")
 
 
-def _watermark_for(principal: Principal) -> str:
-    return f"{principal.user['username']} · {utcnow().strftime('%Y-%m-%d %H:%M UTC')} · TrustVault view-only"
+def _watermark_for(principal: Principal, doc: dict) -> str:
+    """Tiled over every rendered page: who it was rendered for and when - and
+    CONFIDENTIAL in front for a Confidential document."""
+    return (f"{labels.watermark_prefix(doc['classification'])}{principal.user['username']} · "
+            f"{utcnow().strftime('%Y-%m-%d %H:%M UTC')} · TrustVault view-only")
 
 
 def _current_plaintext(conn, ctx: AppContext, principal: Principal, doc: dict, action: str) -> tuple[dict, bytes]:
@@ -311,7 +323,7 @@ def preview_document(doc_id: str, principal: Principal = Depends(current_princip
     d = require_access(conn, ctx, principal, doc_id, Action.VIEW, link_token=link, audit_action="document.preview")
     doc = d.doc
     version, data = _current_plaintext(conn, ctx, principal, doc, "document.preview")
-    watermark = _watermark_for(principal)
+    watermark = _watermark_for(principal, doc)
     try:
         extension, source, renderer = _render_source(ctx, version, data)
         kind = kind_for(extension)
@@ -326,7 +338,8 @@ def preview_document(doc_id: str, principal: Principal = Depends(current_princip
         ctx.audit.append(tx, principal.audit_ctx, "document.preview", "allowed", document_id=doc["id"],
                          details={"version_id": version["id"], "kind": result["kind"], "renderer": renderer,
                                   "pages": result.get("pages"), **_access_details(d)})
-    return {**result, "watermark": watermark, "filename": version["original_filename"], "renderer": renderer,
+    return {**result, "watermark": watermark, "classification": doc["classification"],
+            "filename": version["original_filename"], "renderer": renderer,
             "version_no": version["version_no"], "can_download": d.permission != "view",
             "access_via": d.via, "access_expires_at": d.access_expires_at}
 
@@ -341,7 +354,7 @@ def preview_page(doc_id: str, page_no: int, principal: Principal = Depends(curre
     version, data = _current_plaintext(conn, ctx, principal, doc, "document.preview_page")
     try:
         extension, source, _ = _render_source(ctx, version, data)
-        png = render_page(extension, source, page_no, _watermark_for(principal))
+        png = render_page(extension, source, page_no, _watermark_for(principal, doc))
     except NoSuchPage:
         raise HTTPException(status_code=404, detail="No such page")
     except PreviewError as exc:
@@ -401,6 +414,26 @@ def update_document(doc_id: str, body: DocumentUpdate, principal: Principal = De
     return {"ok": True, "changed": sorted(changes)}
 
 
+@router.put("/{doc_id}/classification",
+            summary="Change the label: public, internal or confidential (owner only). Raising it to confidential "
+                    "cancels outstanding share links.")
+def classify_document(doc_id: str, body: ClassificationRequest, principal: Principal = Depends(current_principal),
+                      conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
+    doc = require_access(conn, ctx, principal, doc_id, Action.CLASSIFY, audit_action="document.classified").doc
+    old, new = doc["classification"], body.classification
+    if old == new:
+        return {"ok": True, "classification": new, "changed": False}
+    raised = labels.RANK[new] > labels.RANK[old]
+    with transaction(conn) as tx:
+        tx.execute("UPDATE documents SET classification = ?, updated_at = ? WHERE id = ?", (new, now_iso(), doc["id"]))
+        if raised and new == "confidential":  # AUTHZ-CHECK[confidential-cancels-old-links]
+            # Links issued while it was Internal or Public should not outlive that.
+            tx.execute("UPDATE documents SET access_version = access_version + 1 WHERE id = ?", (doc["id"],))
+        ctx.audit.append(tx, principal.audit_ctx, "document.classified", "allowed", document_id=doc["id"],
+                         details={"from": old, "to": new, "links_invalidated": raised and new == "confidential"})
+    return {"ok": True, "classification": new, "changed": True}
+
+
 @router.delete("/{doc_id}", summary="Move to trash (owner only). Grants and links stop working at once.")
 def delete_document(doc_id: str, principal: Principal = Depends(current_principal),
                     conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
@@ -438,7 +471,7 @@ def purge_document(doc_id: str, principal: Principal = Depends(current_principal
     return {"ok": True, "versions_shredded": n}
 
 
-@router.get("/{doc_id}/activity", summary="Audit trail of this document (owner only)")
+@router.get("/{doc_id}/activity", summary="Audit trail of this document (owner only; refusal reasons are admin-only)")
 def document_activity(doc_id: str, limit: int = Query(200, ge=1, le=1000),
                       principal: Principal = Depends(current_principal),
                       conn: sqlite3.Connection = Depends(get_db), ctx: AppContext = Depends(app_ctx)):
@@ -448,4 +481,12 @@ def document_activity(doc_id: str, limit: int = Query(200, ge=1, le=1000),
            WHERE document_id = ? ORDER BY seq DESC LIMIT ?""",
         (doc["id"], limit),
     ).fetchall()
-    return {"items": [{**dict(r), "details": json.loads(r["details"])} for r in rows]}
+    # The owner sees who did what and whether it was allowed - but never WHY a
+    # request was refused: the internal reasons are for administrators only.
+    items = []
+    for r in rows:
+        details = json.loads(r["details"])
+        for key in INTERNAL_DETAIL_KEYS:
+            details.pop(key, None)
+        items.append({**dict(r), "details": details})
+    return {"items": items}

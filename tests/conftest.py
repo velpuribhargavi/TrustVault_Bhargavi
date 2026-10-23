@@ -114,7 +114,7 @@ class Client:
     def login(self, username: str, password: str | None = None, **extra):
         r = self.http.post("/api/auth/login", json={"username": username,
                                                     "password": password or PASSWORDS[username], **extra})
-        if r.status_code == 200:
+        if r.status_code == 200 and "csrf_token" in r.json():
             self.csrf = r.json()["csrf_token"]
             self.user = r.json()["user"]
             self.username = username
@@ -134,6 +134,9 @@ class Client:
 
     def patch(self, url, **kw):
         return self.request("PATCH", url, **kw)
+
+    def put(self, url, **kw):
+        return self.request("PUT", url, **kw)
 
     def delete(self, url, **kw):
         return self.request("DELETE", url, **kw)
@@ -155,6 +158,9 @@ def settings(tmp_path, monkeypatch):
         argon2_time_cost=1, argon2_memory_kib=1024, argon2_parallelism=1,
         login_rate_per_ip_per_minute=1000, link_rate_per_user_per_minute=1000,
         office_renderer="off",  # tests that need LibreOffice switch it on themselves
+        # Two-step sign-in is optional here so every other test can sign in with a
+        # password; tests/test_two_factor.py turns the real policy (admin, owner) on.
+        totp_required_roles=(),
         max_upload_bytes=1024 * 1024,
         durable_writes=False,  # skip fsync: tests do not need power-cut durability
     )

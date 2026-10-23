@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import secrets
 import shutil
 import sys
 import zipfile
@@ -19,10 +20,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from trustvault import totp, twofactor  # noqa: E402
 from trustvault.audit import AuditContext  # noqa: E402
 from trustvault.config import load_settings  # noqa: E402
 from trustvault.context import AppContext  # noqa: E402
 from trustvault.db import SchemaVersionError, connect, init_schema, transaction  # noqa: E402
+from trustvault.main import record_upgrade  # noqa: E402
 from trustvault.services import store_version  # noqa: E402
 from trustvault.utils import iso_in, new_id, now_iso  # noqa: E402
 from trustvault.validation import validate_upload  # noqa: E402
@@ -34,6 +37,26 @@ USERS = [
     ("admin", "Asha Admin", "admin", "Keeper!Vault2026", False),
     ("owner", "Olivia Owner", "owner", "Author!Vault2026", False),
     ("viewer", "Vikram Viewer", "viewer", "Reader!Vault2026", False),
+]
+
+
+# Two-step sign-in is required for administrators and owners. So that anyone
+# judging the demo can sign in as them, the DEMO accounts use these published
+# keys: add one to an authenticator app ("Enter a setup key"), or run
+# `python scripts/demo_code.py`. In real use every person scans their own QR code
+# on first sign-in and nobody else ever sees the key.
+DEMO_TOTP_KEYS = {
+    "admin": "DOO6FYATPLLHM2EP7AHYFUIJVMOGUMF3",
+    "owner": "OY6QL5X34F2DETHPQY6YE7ZMX7R3UBXY",
+}
+
+# Not a login (random password, never printed): a contractor who was given
+# access weeks ago and never used it - what Admin -> Access review -> "Unused
+# access" exists to find.
+STALE_PEOPLE = [("ravi", "Ravi Rao (contractor)", "viewer", True)]
+STALE_GRANTS = [
+    # user, document name, level, granted N days ago, ends in N days
+    ("ravi", "Q3 services contract - Acme Corp", "download", 45, 135),
 ]
 
 
@@ -122,6 +145,18 @@ SALARY = pdf(
 # or shorten them in the UI.
 SEED_GRANT_DAYS = 7
 
+# Classification labels (Public / Internal / Confidential). Confidential documents
+# are marked CONFIDENTIAL on every preview page and new access to them defaults
+# to View only for 1 hour.
+SEED_LABELS = {
+    "Salary letter - Vikram": "confidential",
+    "Board minutes - private": "confidential",
+    "Audit papers FY2025-26": "confidential",
+    "Q3 services contract - Acme Corp": "internal",
+    "Budget 2026": "internal",
+    "Office floor plan": "public",
+}
+
 DOCUMENTS = [
     # owner, filename, display name, category, description, content, grants [(user, level, days)]
     ("owner", "salary-letter-vikram.pdf", "Salary letter - Vikram", "hr",
@@ -141,7 +176,7 @@ DOCUMENTS = [
      "NOT shared with anyone. Vikram must never be able to reach it.",
      pdf("BOARD MINUTES - PRIVATE\n\nDiscussion of the planned acquisition. Not for distribution."), []),
     ("owner", "audit-papers-fy2026.csv", "Audit papers FY2025-26", "audit",
-     "Not shared with anyone. Try a 5-minute share link: Share link -> Vikram -> open it as viewer.",
+     "Not shared with anyone.",
      b"account,description,amount\n4000,Revenue,1250000.00\n5000,Cost of sales,-640000.00\n6100,Salaries,-310000.00\n",
      []),
 ]
@@ -164,11 +199,18 @@ def main() -> None:
         print(f"Removed {inst}")
 
     try:
-        init_schema(settings.db_path)
+        upgrade = init_schema(settings.db_path)
     except SchemaVersionError as exc:
         print(f"\n{exc}\n")
         sys.exit(1)
     ctx = AppContext.build(settings, create_keys=True)
+    conn = connect(settings.db_path)
+    try:
+        record_upgrade(conn, ctx, upgrade)
+    finally:
+        conn.close()
+    if upgrade is not None and upgrade.changed:
+        print(f"Upgraded : schema v{upgrade.from_version} -> v{upgrade.to_version} ({'; '.join(upgrade.steps)})")
     print(f"Database : {settings.db_path}")
     print(f"Keys     : {settings.keys_dir} (keep these secret and backed up separately)")
 
@@ -200,13 +242,15 @@ def main() -> None:
         actor = AuditContext(ids[owner], owner, "local", "init_db.py")
         doc_id = new_id()
         with transaction(conn) as tx:
-            tx.execute("""INSERT INTO documents (id, owner_id, name, category, description, created_at, updated_at)
-                          VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                       (doc_id, ids[owner], name, category, description, now_iso(), now_iso()))
+            tx.execute("""INSERT INTO documents (id, owner_id, name, category, description, classification, created_at,
+                                                 updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (doc_id, ids[owner], name, category, description, SEED_LABELS.get(name, "internal"),
+                        now_iso(), now_iso()))
             v = store_version(tx, ctx, document_id=doc_id, filename=safe_name, file_type=ftype, data=content,
                               uploaded_by=ids[owner])
             ctx.audit.append(tx, actor, "document.upload", "allowed", document_id=doc_id,
                              details={"name": name, "filename": safe_name, "category": category,
+                                      "classification": SEED_LABELS.get(name, "internal"),
                                       "size": v["size_bytes"], "sha256": v["sha256"], "seeded": True})
             for user, perm, days in grants:
                 expires = iso_in(days=days)
@@ -217,6 +261,42 @@ def main() -> None:
                                  details={"permission": perm, "expires_at": expires, "target_username": user,
                                           "target_external": False, "grant_id": gid, "seeded": True})
 
+    # Someone who was given access long ago and never used it.
+    with transaction(conn) as tx:
+        for username, display, role, external in STALE_PEOPLE:
+            uid = new_id()
+            ids[username] = uid
+            tx.execute(
+                """INSERT INTO users (id, username, display_name, password_hash, role, is_external, created_at,
+                                      password_changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (uid, username, display, ctx.passwords.hash(secrets.token_urlsafe(24) + "Aa1!"), role, int(external),
+                 iso_in(days=-60), iso_in(days=-60)))
+            ctx.audit.append(tx, seed_ctx, "user.create", "allowed", target_user_id=uid,
+                             details={"username": username, "role": role, "is_external": external, "seeded": True})
+        docs = {r["name"]: r for r in tx.execute("SELECT id, owner_id, name FROM documents")}
+        for username, doc_name, perm, ago, left in STALE_GRANTS:
+            doc = docs[doc_name]
+            gid = new_id()
+            tx.execute("""INSERT INTO grants (id, document_id, user_id, permission, granted_by, created_at, expires_at)
+                          VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                       (gid, doc["id"], ids[username], perm, doc["owner_id"], iso_in(days=-ago), iso_in(days=left)))
+            ctx.audit.append(tx, AuditContext(doc["owner_id"], "owner", "local", "init_db.py"), "access.granted",
+                             "allowed", document_id=doc["id"], target_user_id=ids[username],
+                             details={"permission": perm, "expires_at": iso_in(days=left), "target_username": username,
+                                      "target_external": True, "grant_id": gid, "seeded": True,
+                                      "backdated_created_at": iso_in(days=-ago)})
+
+    # Two-step sign-in for the demo administrator and owner, with the published keys.
+    backup: dict[str, list[str]] = {}
+    with transaction(conn) as tx:
+        for username, key in DEMO_TOTP_KEYS.items():
+            uid = ids[username]
+            tx.execute("UPDATE users SET totp_secret = ?, totp_enabled_at = ? WHERE id = ?",
+                       (twofactor.seal_secret(ctx, uid, key), now_iso(), uid))
+            backup[username] = twofactor.new_backup_codes(tx, ctx, uid)
+            ctx.audit.append(tx, seed_ctx, "auth.2fa_enrolled", "allowed", target_user_id=uid,
+                             details={"via": "seed", "backup_codes": len(backup[username]), "seeded": True})
+
     print("\nThe three demo logins (change these before any real use):")
     print(f"  {'role':8} {'username':9} password")
     for username, _, role, password, external in USERS:
@@ -224,7 +304,14 @@ def main() -> None:
     print(f"\nWhat 'viewer' can do with each of owner's documents (grants last {SEED_GRANT_DAYS} days):")
     for _, _, name, _, _, _, grants in DOCUMENTS:
         level = grants[0][1] if grants else "NO ACCESS"
-        print(f"  {level:10} {name}")
+        print(f"  {level:10} {name}  [{SEED_LABELS.get(name, 'internal')}]")
+    print("\nTwo-step sign-in (required for admin and owner). In an authenticator app choose")
+    print('"Enter a setup key", type the key below (time-based), or run: python scripts/demo_code.py')
+    for username, key in DEMO_TOTP_KEYS.items():
+        print(f"  {username:8} key {totp.grouped(key)}")
+        print(f"           backup codes (each works once): {' '.join(backup[username])}")
+    print(f"\nUnused-access review: '{STALE_GRANTS[0][0]}' (not a login) has had {STALE_GRANTS[0][2]} access to "
+          f"'{STALE_GRANTS[0][1]}' for {STALE_GRANTS[0][3]} days without using it.")
     print(f"\nTime limits: new grants {settings.default_grant_minutes} min by default, share links "
           f"{settings.link_ttl_seconds // 60} min, sign-out after {settings.session_idle_minutes} min idle "
           f"or {settings.session_absolute_hours} h.")

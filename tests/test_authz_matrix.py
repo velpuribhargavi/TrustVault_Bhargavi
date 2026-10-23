@@ -1,6 +1,6 @@
 """The core promise: a document is reachable only by someone who was granted it.
 
-Every document endpoint is called by every kind of caller and the status
+Every document endpoint (18 of them) is called by every kind of caller and the status
 code is checked against the permission model. Every refusal must also
 (a) be the one uniform answer - 403 "You don't have access to this file." -
 whatever the real reason, (b) leave no side effect and (c) leave a 'denied'
@@ -36,10 +36,11 @@ ACTIONS = {
     "extend": ("POST", "/api/documents/{doc}/grants/{grant}/extend", {"json": {"minutes": 60}}, True),
     "revoke": ("DELETE", "/api/documents/{doc}/grants/{grant}", {}, True),
     "list_links": ("GET", "/api/documents/{doc}/links", {}, False),
-    "create_link": ("POST", "/api/documents/{doc}/links", {"json": {"username": "frank", "permission": "download"}}, True),
+    "create_link": ("POST", "/api/documents/{doc}/links", {"json": {"username": "gina", "permission": "view"}}, True),
     "revoke_links": ("POST", "/api/documents/{doc}/links/revoke-all", {}, True),
     "suggestions": ("GET", "/api/documents/{doc}/suggestions", {}, False),
     "activity": ("GET", "/api/documents/{doc}/activity", {}, False),
+    "classify": ("PUT", "/api/documents/{doc}/classification", {"json": {"classification": "public"}}, True),
     "delete": ("DELETE", "/api/documents/{doc}", {}, True),
 }
 
@@ -67,8 +68,8 @@ CASES = [(caller, action) for caller in EXPECTED for action in ACTIONS]
 
 
 def _snapshot(db, doc_id):
-    doc = dict(db.execute("SELECT name, deleted_at, current_version_id, access_version FROM documents WHERE id = ?",
-                          (doc_id,)).fetchone())
+    doc = dict(db.execute("SELECT name, deleted_at, current_version_id, access_version, classification "
+                          "FROM documents WHERE id = ?", (doc_id,)).fetchone())
     doc["grants"] = sorted(tuple(r) for r in db.execute(
         "SELECT user_id, permission, expires_at FROM grants WHERE document_id = ?", (doc_id,)))
     doc["links_made"] = db.execute("SELECT COUNT(*) FROM audit_log WHERE action = 'link.created' AND outcome = 'allowed'"
@@ -114,8 +115,8 @@ def test_document_access_matrix(world, db, caller, action):
         reason = json.loads(denied[-1]["details"])["reason"]
         expected_reason = REASON.get(caller)
         if expected_reason is None:  # a grant holder asking for more than their level
-            perm = {"dave": "edit", "carol": "download", "gina": "view"}[caller]
-            assert reason.startswith(f"{perm}_cannot_"), reason
+            expected_prefix = {"dave": "edit_cannot_", "carol": "download_cannot_", "gina": "view_only"}[caller]
+            assert reason.startswith(expected_prefix), reason
         else:
             assert reason == expected_reason, reason
 

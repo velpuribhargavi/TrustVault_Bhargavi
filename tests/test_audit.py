@@ -150,3 +150,13 @@ def test_log_injection_is_inert(world, db):
     row = audit_rows(db, action="auth.login", outcome="denied")[-1]
     assert "\n" not in row["actor_name"]
     assert verify(world)["ok"] is True
+
+
+def test_only_admins_see_why_a_request_was_refused(world):
+    """The owner sees that bob was refused - not why. The reason is admin-only."""
+    world["bob"].get(f"/api/documents/{world.doc_a}/download")
+    items = world["alice"].get(f"/api/documents/{world.doc_a}/activity").json()["items"]
+    refused = [i for i in items if i["outcome"] == "denied" and i["actor_name"] == "bob"]
+    assert refused and all("reason" not in i["details"] and "requested_id" not in i["details"] for i in refused)
+    admin_view = world["admin"].get("/api/admin/audit", params={"outcome": "denied", "actor": "bob"}).json()["items"]
+    assert admin_view[0]["details"]["reason"] == "no_grant"

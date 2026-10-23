@@ -7,3 +7,4 @@ cryptography>=42.0
 argon2-cffi>=23.1
 pypdfium2>=4.20      # renders PDF pages for view-only access (PDFium; Apache-2.0/BSD)
 Pillow>=10.1         # draws the watermark on rendered pages and images
+segno>=1.6           # draws the QR code for setting up two-step sign-in (pure Python, BSD)
