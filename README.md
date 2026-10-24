@@ -1,10 +1,18 @@
 # TrustVault
-Live Url:https://trustvault-xfsj.onrender.com
+**Live Url:**https://trustvault-xfsj.onrender.com
 
-1. Admin Account (Full Access):Role: Can view all documents, manage usersLogin Method: Option A - TOTP Code: Get a 6-digit code by running python scripts/demo_code.py in Render ShellOption B - Backup Code: Available in Render Logs. Search for backup codes2. Owner Account (Restricted Access):Role: Can only view and manage their own documentsSame login method as aboveWhy no Register Button?
-For a secure vault, open registration is a vulnerability. Roles are assigned server-side, which follows enterprise security best practices (like AWS IAM). This demonstrates proper RBAC implementation.How to get Live Codes:
-Render Dashboard > Your Service > Logs Tab > Search backup codes
-The Backup code will display on Render website.
+**1. Admin Account (Full Access):**
+ Role: Can view all documents, manage usersLogin Method:
+ Option A - TOTP Code: Get a 6-digit code by running python scripts/demo_code.py in Render Shell
+ Option B - Backup Code: Available in Render Logs. Search for backup codes
+ 
+**2. Owner Account (Restricted Access):**
+ Role: Can only view and manage their own documentsSame login method as above
+ Why no Register Button?
+ For a secure vault, open registration is a vulnerability. Roles are assigned server-side, which follows enterprise security best practices (like AWS IAM).
+ This demonstrates proper RBAC  implementation.
+** How to get Live Codes**:
+ Render Dashboard > Your Service > Logs Tab > Search backup codes
 
 Secure document sharing where **the wrong person can never read the file** and you can **prove who read it**.
 
