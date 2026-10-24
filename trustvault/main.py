@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-__version__ = "0.1.0"
+from . import __version__
 from . import classification as labels
 from .config import Settings, load_settings
 from .context import AppContext
@@ -32,12 +32,16 @@ from .validation import ALLOWED_TYPES, CATEGORIES
 log = logging.getLogger("trustvault")
 STATIC_DIR = Path(__file__).with_name("static")
 
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     first_run = not settings.db_path.exists()
     upgrade = init_schema(settings.db_path, durable=settings.durable_writes)
     ctx = AppContext.build(settings, create_keys=first_run)
 
+    # Housekeeping at start-up: finish a schema upgrade (hash backfill needs
+    # the audit key), sessions that ended while the server was down, grants
+    # that expired while it was down, and trash past retention.
     conn = connect(settings.db_path, durable=settings.durable_writes)
     try:
         record_upgrade(conn, ctx, upgrade)
@@ -50,25 +54,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="TrustVault API",
         version=__version__,
-        description="Secure document sharing with a tamper-evident audit trail.",
+        description="Secure document sharing with a tamper-evident audit trail. "
+                    "Every endpoint states who may call it. See API.md for the full table.",
         docs_url="/api/docs" if settings.enable_api_docs else None,
         redoc_url=None,
         openapi_url="/api/openapi.json" if settings.enable_api_docs else None,
     )
     app.state.ctx = ctx
 
+    # Body limit: the largest legitimate request is one upload plus form overhead.
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_upload_bytes + 512 * 1024)
     app.add_middleware(SecurityHeadersMiddleware, hsts=settings.cookie_secure)
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(request: Request, exc: StarletteHTTPException):
         body = {"detail": exc.detail}
-        if getattr(exc, "code", None):
+        if getattr(exc, "code", None):  # errors.CodedHTTPException: no_access, session_expired
             body["code"] = exc.code
         return JSONResponse(body, status_code=exc.status_code, headers=getattr(exc, "headers", None))
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
+        # Report which fields are wrong without echoing the submitted values back.
         problems = [{"field": ".".join(str(p) for p in e.get("loc", [])[1:]), "problem": e.get("msg")}
                     for e in exc.errors()]
         return JSONResponse({"detail": "Invalid request", "problems": problems}, status_code=422)
@@ -109,9 +116,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     return app
 
+
 SYSTEM_MIGRATION = AuditContext(actor_id=None, actor_name="system:migration", ip=None, user_agent=None)
 
+
 def record_upgrade(conn, ctx: AppContext, upgrade) -> None:
+    """Backfill hashes for a pre-chain audit table, then record the upgrade
+    itself as an audit event (so the trail shows when the schema changed)."""
     if upgrade is None:
         return
     import_legacy_audit(conn, ctx.audit, upgrade)
@@ -121,7 +132,10 @@ def record_upgrade(conn, ctx: AppContext, upgrade) -> None:
         log.info("Database upgraded from schema v%s to v%s: %s", upgrade.from_version, upgrade.to_version,
                  "; ".join(upgrade.steps))
 
+
 def end_stale_sessions(conn, ctx: AppContext) -> int:
+    """Remove sessions that hit the idle or absolute limit while nobody used
+    them, recording each as auth.session_expired."""
     now = utcnow()
     rows = conn.execute("""SELECT s.token_hash, s.created_at, s.last_seen_at, s.expires_at, u.id, u.username
                            FROM sessions s JOIN users u ON u.id = s.user_id""").fetchall()
@@ -138,5 +152,3 @@ def end_stale_sessions(conn, ctx: AppContext) -> int:
                                                   "signed_in_at": row["created_at"], "detected": "start-up"})
                 ended += 1
     return ended
-
-app = create_app()
