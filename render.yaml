@@ -1,17 +1,21 @@
 services:
-    - type: web
-      name: trustvault
-      runtime: docker
-      plan: free
-      region: singapore
-      branch: main
-      dockerfilePath: ./Dockerfile
-      envVars:
-        - key: TV_MASTER_KEY
-          generateValue: true
-        - key: TV_AUDIT_KEY
-          generateValue: true
-        - key: TV_DEMO_MODE
-          value: 1
-        - key: TV_TRUSTED_PROXIES
-          value: 1
+  - type: web
+    name: trustvault
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: main
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      # The app reads every setting with the TRUSTVAULT_ prefix (see trustvault/config.py).
+      # Render generates a random base64 256-bit value, which is the format the keys need.
+      - key: TRUSTVAULT_MASTER_KEY
+        generateValue: true
+      - key: TRUSTVAULT_AUDIT_KEY
+        generateValue: true
+      # Render serves the site over HTTPS behind its own proxy.
+      - key: TRUSTVAULT_COOKIE_SECURE
+        value: "1"
+      - key: TRUSTVAULT_TRUST_PROXY
+        value: "1"
