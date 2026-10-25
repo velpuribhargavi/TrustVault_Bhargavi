@@ -239,54 +239,6 @@ Two browser windows (one normal, one private) make the "two people" demos easy.
 test.bat                         REM or: python -m pytest
 ```
 
-**507 tests** run in about two minutes. They include:
-
-- `tests/test_authz_matrix.py` - **every document endpoint × every kind of caller** (owner, edit, download, view-only, no grant, expired grant, admin, anonymous - 162 cases). Each refusal is checked to be *the same 403 message*, to have *no side effect* and to leave *an audit record with the right internal reason*. A structural test proves every document route calls `require_access()` first.
-- `tests/test_authz_unit.py` - `check_access()` itself: every refusal reason, in order (`not_found`, `no_grant`, `grant_expired`, `view_only`, `wrong_user`, `link_expired`, `link_revoked`, ...).
-- `tests/test_time_limits.py`, `tests/test_links.py`, `tests/test_sessions.py` - 30-minute grants, extend/revoke, `access.expired`, 5-minute recipient-bound links, 15-minute idle and 8-hour sessions - with the server clock moved forward, no sleeping.
-- `tests/test_view_levels.py` - view-only users get watermarked renderings and can never download; each level allows exactly what it says; text extraction for Word/Excel/PowerPoint; XML bombs are not expanded.
-- `tests/test_idor.py` - cross-object attacks (version / grant / link / suggestion of another document).
-- `tests/test_revocation.py` - revoke, deactivate, password change, logout, idle and absolute expiry: all immediate.
-- `tests/test_audit.py` - edits, deletions, re-ordering, truncation and re-hashing of the audit log are all detected.
-- `tests/test_audit_page.py` - the audit page through the API: admin-only (and refusals recorded), the action dropdown matches the database, denial-reason and quick filters, plain-language sentences for every action and reason, the detail panel's hash check and same-session events, CSV export (filters, SHA-256 logged, formula injection neutralised, chain columns link up, size limit), *"Chain intact (N events)"* / first broken or missing event, and that each filter uses its index.
-- `tests/test_migrations.py` - real v3, v4 and v5 databases are upgraded in place with their chain intact; an audit table without hashes gets them backfilled; too-old / too-new databases are refused clearly.
-- `tests/test_two_factor.py` - two-step sign-in: RFC 6238 test vectors, no session before the second step, forced set-up for admins and owners (and a wrong first code turns nothing on), codes never reused, 3 wrong codes end the attempt, 5 failures lock the account, backup codes single-use and per person, secrets sealed and never sent out, admin reset, bearer mode, the alert.
-- `tests/test_account_sessions.py` - session list (only your own), sign out one / everywhere on the server, cookie flags over HTTP, HTTPS and behind a proxy, security headers, lockout and rate-limit audit events.
-- `tests/test_access_review.py` - grants unused for 30 days flagged from the audit trail, bulk revoke bumps each document's `access_version` once and kills its links, admin only.
-- `tests/test_access_requests.py` - ask → approve with level and duration / deny with a reason; the same answer for a made-up id; only the document's owner decides (and only once, only while pending); requests private to the asker; spam limits; 14-day lapse; Confidential defaults; every step audited.
-- `tests/test_classification.py` - default Internal, owner-only changes (each audited from → to), CONFIDENTIAL on every rendered page, View only for 1 hour, raising to Confidential kills share links, the badge in every list, Public opens nothing.
-- `tests/test_uploads.py` - executables, HTML/SVG, PDF JavaScript, Office macros, remote templates, zip bombs, CSV formula injection...
-- and Office rendering, search leakage, CSRF, storage encryption, admin limits, AI suggestions, HTTP hardening.
-
-### Prove the tests test something (mutation check)
-
-The judges will remove one authorisation check and re-run the tests. This tool does that for **every** check:
-
-```bat
-mutation.bat                     REM or: python tools/mutation_check.py --jobs 4
-python tools/mutation_check.py --list    REM see each check and how it is removed
-```
-
-Every security check in the code is tagged `# AUTHZ-CHECK[name]` (or `AUTHZ-SQL`). The tool copies the project,
-removes one check (turns `if <deny-condition>:` into `if False:`, or blanks the SQL filter), runs the suite, and
-requires it to **fail**. Result: **71/71 mutants killed** - removing any single check breaks at least one test
-(full report: `docs/mutation_report.txt`).
-
-### Attack the running system
-
-With the server running, in a second terminal:
-
-```bat
-.venv\Scripts\activate
-python scripts\attack_selftest.py        REM 64 real HTTP checks as admin/owner/viewer; PASS/FAIL for each
-python scripts\verify_audit.py           REM offline audit-chain verification (exit code 1 if tampered)
-python scripts\tamper_demo.py            REM edits a COPY of the audit log and shows detection
-python scripts\migrate.py                REM backup + schema upgrade + "Chain intact (N events)" (start-up does this too)
-python scripts\demo_code.py              REM current two-step codes of the demo admin and owner
-```
-
----
-
 ## 4. How it is built
 
 ```
@@ -327,18 +279,6 @@ POST /api/auth/login/verify  challenge + 6-digit code or backup code ─► sess
 POST /api/auth/login/enroll  challenge + first code ─► session + 10 backup codes (shown once)
 ```
 
-Request path for a download:
-
-```
-cookie/bearer token ─► deps.current_principal ─► sessions ⋈ users   (exists? idle < 15 min? < 8 h? user active? CSRF for writes)
-                    ─► authz.require_access(user, doc, DOWNLOAD, link?)
-                         check_access: document exists → user active → not admin → owner / live grant / valid link
-                                       for this person → not in trash → level allows it → version belongs to it
-                         └─ refused → audit 'denied' row with the reason → 403 "You don't have access to this file."
-                    ─► decrypt blob (AAD = doc id + version id) ─► verify SHA-256
-                    ─► audit 'allowed' row (BEFORE any byte is sent; if this fails, nothing is sent)
-                    ─► response: attachment, nosniff, CSP sandbox, no-store
-```
 
 ---
 
@@ -363,14 +303,6 @@ cookie/bearer token ─► deps.current_principal ─► sessions ⋈ users   (e
 | Retention | Trashed documents are crypto-shredded after `TRASH_RETENTION_DAYS` (default 30), checked at start-up. |
 | Configuration | Environment variables, see `.env.example` (`TRUSTVAULT_COOKIE_SECURE=1` when served over HTTPS). |
 | API docs (interactive) | http://127.0.0.1:8000/api/docs |
-
-### Deploying beyond your own machine
-
-The app binds to `127.0.0.1` by default. To expose it, put it behind a TLS-terminating reverse proxy
-(Caddy / nginx / IIS), run `python -m trustvault --host 0.0.0.0`, and set `TRUSTVAULT_COOKIE_SECURE=1`,
-`TRUSTVAULT_TRUST_PROXY=1` (only behind your proxy), and the two keys from a secret manager
-(`TRUSTVAULT_MASTER_KEY`, `TRUSTVAULT_AUDIT_KEY`). Run a **single worker** (rate limiting is in-process; see THREATS.md T51).
-
 ## 6. Reset
 
 ```bat
